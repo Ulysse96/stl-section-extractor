@@ -1,0 +1,11 @@
+# Personal scans and large reference files — not part of the code project
+*.pdf
+住江帽子/
+印鑑/
+物差し/
+詰物/
+*_sections/
+
+# Python
+__pycache__/
+*.pyc
