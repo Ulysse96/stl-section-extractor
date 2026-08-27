@@ -1,0 +1,4 @@
+# Normalize line endings to LF in the repo, checked out as the
+# platform default, so Git stops warning about LF/CRLF conversion
+# on every commit.
+* text=auto
