@@ -842,7 +842,7 @@ def collect_curve_endpoints(main_curves):
     return np.asarray(points, dtype=float)
 
 
-def build_surface_grid(all_section_data, found_intersections):
+def build_surface_grid(all_section_data, found_intersections, curve_override=None):
     """
     Assembles the A x B section curves into the grid used for
     surface reconstruction: every curve is cut into segments at
@@ -853,6 +853,17 @@ def build_surface_grid(all_section_data, found_intersections):
     gap), and every interior 4-sided cell -- bounded by 2
     consecutive A curves and 2 consecutive B curves -- is
     collected with its 4 boundary edges, ready for a Coons patch.
+
+    `curve_override`, if given, is a {(direction, number): points_3d}
+    dict used INSTEAD of all_section_data's own points_3d for that
+    curve. section_stl.py's reconstruction method 2 rebuilds every
+    main curve to a minimal "start + intersections + end" polyline,
+    which loses the actual scanned shape between crossings -- cell
+    edges built from that come out flat/near-planar instead of
+    following the surface. section_stl.py snapshots the curves
+    BEFORE that rebuild and passes the snapshot here for exactly
+    this reason; a curve missing from the override falls back to
+    all_section_data as before.
 
     Each crossing's position along its two curves is found fresh, by
     nearest point, against `points_3d` as given in `all_section_data`
@@ -893,6 +904,8 @@ def build_surface_grid(all_section_data, found_intersections):
         boundary loop via collect_curve_endpoints).
     """
 
+    curve_override = curve_override or {}
+
     main_curves = {}
 
     for data in all_section_data:
@@ -904,10 +917,13 @@ def build_surface_grid(all_section_data, found_intersections):
 
         key = (data["direction"], data["number"])
 
-        main_curves[key] = np.asarray(
-            data["curves"][main_index]["points_3d"],
-            dtype=float
-        )
+        if key in curve_override:
+            main_curves[key] = np.asarray(curve_override[key], dtype=float)
+        else:
+            main_curves[key] = np.asarray(
+                data["curves"][main_index]["points_3d"],
+                dtype=float
+            )
 
     crossing_by_pair = {
         (i, j): entry

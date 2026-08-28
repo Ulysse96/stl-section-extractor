@@ -540,6 +540,52 @@ def test_build_surface_grid_ignores_stale_idx_after_curve_rebuild():
     assert len(grid["cells"]) == 4
 
 
+def test_build_surface_grid_uses_curve_override_for_richer_edges():
+    # Regression test: reconstruction method 2 rebuilds every main
+    # curve to a minimal "start + intersections + end" polyline,
+    # which loses the actual scanned shape BETWEEN crossings --
+    # cell edges built from that come out flat/near-planar instead
+    # of following the real surface. curve_override lets the caller
+    # (section_stl.py, from a snapshot taken before that rebuild)
+    # supply the full-resolution curve instead.
+    all_section_data, found_intersections = _make_lattice_grid_inputs()
+
+    # A richer version of A_2 with extra shaped points between its
+    # x=1 and x=2 crossings that a minimal 2-point segment (what
+    # all_section_data's own lattice fixture has) wouldn't carry.
+    rich_a2 = np.array(
+        [
+            [0, 2, 0], [1, 2, 0],
+            [1.3, 2, 0.5], [1.6, 2, 0.5],
+            [2, 2, 0], [3, 2, 0], [4, 2, 0],
+        ],
+        dtype=float,
+    )
+
+    grid = build_surface_grid(
+        all_section_data,
+        found_intersections,
+        curve_override={("A", 2): rich_a2},
+    )
+
+    cells_by_corner = {(c["a_i"], c["b_j"]): c for c in grid["cells"]}
+
+    # Cell (1,1)'s "hi" edge along A runs on curve A_2 between its
+    # b=1 (x=1) and b=2 (x=2) crossings -- must carry the extra
+    # shaped points from the override, not just the 2 endpoints a
+    # minimal curve would have given.
+    edge = cells_by_corner[(1, 1)]["edge_a_hi"]
+
+    assert len(edge) > 2
+    np.testing.assert_allclose(edge[0], [1, 2, 0])
+    np.testing.assert_allclose(edge[-1], [2, 2, 0])
+
+    # A_1 has no override -- must still fall back to
+    # all_section_data's own points_3d as before.
+    other_edge = cells_by_corner[(1, 1)]["edge_a_lo"]
+    np.testing.assert_allclose(other_edge, [[1, 1, 0], [2, 1, 0]])
+
+
 def test_collect_curve_endpoints_gathers_both_ends_of_every_curve():
     all_section_data, found_intersections = _make_lattice_grid_inputs()
 

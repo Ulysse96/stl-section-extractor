@@ -1572,6 +1572,30 @@ if use_plane_b:
 
 all_section_data = all_section_data_a + all_section_data_b
 
+# Snapshot every main curve's full-resolution shape right here,
+# before either reconstruction method can touch it. Method 2 (see
+# step 11bis below) replaces curve_info["points_3d"] with a minimal
+# "start + intersections + end" polyline so that curve A_i and
+# curve B_j meet at an exact shared point -- but that also throws
+# away the actual scanned shape BETWEEN those intersections. Surface
+# reconstruction (step 14) needs the real, richly-sampled curve for
+# its cell edges -- using the post-rebuild version produced flat,
+# near-planar cells instead of surfaces following the scan -- so it
+# is given this snapshot instead of all_section_data's own (possibly
+# later-simplified) points_3d.
+rich_main_curves = {}
+
+for data in all_section_data:
+
+    main_index = data["main_curve_index"]
+
+    if main_index is not None:
+
+        rich_main_curves[(data["direction"], data["number"])] = np.array(
+            data["curves"][main_index]["points_3d"],
+            dtype=float
+        )
+
 
 # ============================================================
 # 12ter. FIND A x B INTERSECTIONS ON THE FINAL CURVES
@@ -2503,7 +2527,8 @@ if use_plane_b:
 
         surface_grid = build_surface_grid(
             all_section_data,
-            found_intersections
+            found_intersections,
+            curve_override=rich_main_curves
         )
 
         print(
