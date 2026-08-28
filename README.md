@@ -128,5 +128,19 @@ easy to re-run with a different value and compare.
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed
 spline through the ordered open endpoints of every A/B curve — the
-outline of the scanned patch, and the same boundary the STEP surface is
-built from.
+outline of the scanned patch, and (unless excluded, see below) the same
+boundary the STEP surface is built from.
+
+**Excluding sections from the surface**: a real hole or gap in the
+object — a strap adjustment slot on a cap, a vent — isn't scan noise,
+but it does break the "one simple closed boundary" assumption the whole
+surface step relies on: the boundary loop and the surface itself can
+both get dragged into a bad shape right at that hole. The "Exclude from
+surface" field (next to the smoothing tolerance) takes a comma-separated
+list of sections to leave out of the surface reconstruction specifically
+— e.g. `A5, B11` — found by checking the console output (a section with
+an unusually high "Curves detected" count, or lots of "N crossing(s)
+expected, M found" mismatches nearby, is the usual sign) or by looking
+at `boundary_loop.dxf` for where the outline goes wrong. Excluded
+sections are still exported to DXF as normal; they're just left out of
+`order_boundary_loop`'s input and the surface's guide curves.

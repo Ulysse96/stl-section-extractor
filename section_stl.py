@@ -688,9 +688,24 @@ def ask_all_parameters(with_plane_b):
             "Smoothing tolerance (mm):", 2.0
         )
 
+        add_help(
+            "Section(s) to leave out of the reconstructed surface "
+            "(still exported to DXF as usual) -- e.g. a curve "
+            "crossing a real hole/gap in the object (a strap "
+            "adjustment slot, a vent) rather than scan noise, which "
+            "otherwise drags the boundary loop and the surface "
+            "itself into a bad shape right there. Comma-separated, "
+            "e.g. \"A5, B11\". Leave empty to use every section."
+        )
+
+        exclude_sections_var = add_field(
+            "Exclude from surface:", ""
+        )
+
     else:
 
         surface_smoothing_var = None
+        exclude_sections_var = None
 
     def on_submit():
 
@@ -770,9 +785,33 @@ def ask_all_parameters(with_plane_b):
                         "Surface smoothing tolerance must be > 0."
                     )
 
+                excluded = set()
+
+                raw_text = exclude_sections_var.get().strip()
+
+                if raw_text:
+
+                    for token in raw_text.split(","):
+
+                        token = token.strip().upper()
+
+                        if not token:
+                            continue
+
+                        if token[0] not in ("A", "B") or not token[1:].isdigit():
+                            raise ValueError(
+                                f"'{token}' is not a valid section "
+                                "(expected e.g. 'A5' or 'B11')."
+                            )
+
+                        excluded.add((token[0], int(token[1:])))
+
+                result["exclude_from_surface"] = excluded
+
             else:
 
                 result["surface_smoothing_mm"] = None
+                result["exclude_from_surface"] = set()
 
         except ValueError as exc:
 
@@ -821,6 +860,7 @@ max_polynomial_degree = parameters["max_polynomial_degree"]
 r2_target = parameters["r2_target"]
 reconstruction_method = parameters["reconstruction_method"]
 surface_smoothing_mm = parameters["surface_smoothing_mm"]
+exclude_from_surface = parameters["exclude_from_surface"]
 
 
 print()
@@ -1647,6 +1687,24 @@ for data in all_section_data:
 boundary_loop_points = (
     order_boundary_loop(collect_curve_endpoints(rich_main_curves))
     if len(rich_main_curves) >= 3
+    else None
+)
+
+# A separate view of the curve set with the user's excluded sections
+# (real holes/gaps in the object -- e.g. a strap adjustment slot --
+# rather than scan noise) left out, used ONLY for surface
+# reconstruction below. The DXF exports above/below (including
+# boundary_loop.dxf) still use the full, unfiltered rich_main_curves,
+# so excluded sections stay visible there for reference/diagnosis.
+surface_main_curves = {
+    key: points
+    for key, points in rich_main_curves.items()
+    if key not in exclude_from_surface
+}
+
+surface_boundary_loop_points = (
+    order_boundary_loop(collect_curve_endpoints(surface_main_curves))
+    if len(surface_main_curves) >= 3
     else None
 )
 
@@ -2607,12 +2665,21 @@ if boundary_loop_points is not None:
 # which is what this project's actual goal (flattening the result in
 # Wrapstyler) wants: overall shape over local wrinkle fidelity.
 
-if use_plane_b and boundary_loop_points is not None:
+if use_plane_b and surface_boundary_loop_points is not None:
 
     print()
     print("======================================")
     print("SURFACE RECONSTRUCTION (STEP EXPORT)")
     print("======================================")
+
+    if exclude_from_surface:
+
+        print(
+            "  Excluded from surface: "
+            + ", ".join(
+                f"{d}{n}" for d, n in sorted(exclude_from_surface)
+            )
+        )
 
     venv_python = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
@@ -2637,8 +2704,8 @@ if use_plane_b and boundary_loop_points is not None:
     else:
 
         surface_data = {
-            "boundary_loop": boundary_loop_points,
-            "interior_curves": list(rich_main_curves.values()),
+            "boundary_loop": surface_boundary_loop_points,
+            "interior_curves": list(surface_main_curves.values()),
             "smoothing_tolerance_mm": surface_smoothing_mm
         }
 
