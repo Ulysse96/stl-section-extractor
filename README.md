@@ -25,3 +25,23 @@ python section_stl.py
 
 See [requirements.txt](requirements.txt). Python 3 with `tkinter` (included
 in standard Windows/macOS installers).
+
+## Code layout
+
+The curve math (resampling, fold stitching, smoothing, spline/polynomial
+fitting, crossing detection) lives in [curve_utils.py](curve_utils.py),
+which has no GUI dependency and can be imported on its own.
+`section_stl.py` itself is the interactive pipeline: it owns every file
+dialog, 3D view and DXF export step, and calls into `curve_utils` for the
+actual geometry processing.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+Tests in [tests/test_curve_utils.py](tests/test_curve_utils.py) cover
+`curve_utils.py` only — `section_stl.py` runs its GUI pipeline as soon as
+it is imported, so it isn't unit-tested directly.
