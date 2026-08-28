@@ -2807,6 +2807,22 @@ if surface_boundary_loop_points is not None and excluded_from_surface:
 
     print(surface_boundary_path)
 
+elif surface_boundary_loop_points is not None:
+
+    # No exclusions this run -- remove any boundary_loop_surface.dxf
+    # left over from an earlier run that DID exclude sections, so the
+    # output folder can't be mistaken for still reflecting exclusions
+    # that no longer apply (it would otherwise sit there looking
+    # identical to boundary_loop.dxf, since both now come from the
+    # same, unfiltered curve set).
+    stale_surface_boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop_surface.dxf"
+    )
+
+    if os.path.isfile(stale_surface_boundary_path):
+        os.remove(stale_surface_boundary_path)
+
 
 # ============================================================
 # 14. SURFACE RECONSTRUCTION (STEP EXPORT)
