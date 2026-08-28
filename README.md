@@ -33,15 +33,15 @@ in standard Windows/macOS installers).
 ## Code layout
 
 The curve math (resampling, fold stitching, smoothing, spline/polynomial
-fitting, crossing detection, A×B grid assembly) lives in
+fitting, crossing detection, boundary loop ordering) lives in
 [curve_utils.py](curve_utils.py), which has no GUI dependency and can be
 imported on its own. `section_stl.py` itself is the interactive pipeline:
 it owns every file dialog, 3D view and DXF export step, and calls into
 `curve_utils` for the actual geometry processing.
-[step_export.py](step_export.py) turns a curve grid into surfaces and
-writes STEP; it only needs OpenCASCADE (`OCP`) + the standard library, no
-GUI or `curve_utils` dependency, so it can run as a standalone process in
-a different Python environment — see
+[step_export.py](step_export.py) turns the boundary loop + section curves
+into a single surface and writes STEP; it only needs OpenCASCADE (`OCP`)
++ the standard library, no GUI or `curve_utils` dependency, so it can run
+as a standalone process in a different Python environment — see
 [Surface reconstruction (STEP export)](#surface-reconstruction-step-export).
 
 ## Tests
@@ -60,18 +60,20 @@ skipped automatically otherwise.
 
 ## Surface reconstruction (STEP export)
 
-When plane B is used, `section_stl.py` also turns the A×B curve grid into
-an actual surface model and exports it as STEP — a finished shell you can
+When plane B is used, `section_stl.py` also turns the scanned patch into
+ONE continuous surface and exports it as STEP — a finished model you can
 open directly (e.g. in FreeCAD), without going through SolidWorks.
 
-The curve-network assembly (`build_surface_grid` in
+The boundary loop (`order_boundary_loop`/`collect_curve_endpoints` in
 [curve_utils.py](curve_utils.py)) is pure Python/numpy and needs nothing
-extra. Turning it into surfaces (`step_export.py`) needs an OpenCASCADE
-binding (`cadquery`'s `OCP`), which currently has **no Windows wheels for
-Python 3.13/3.14** — only up to 3.12. `section_stl.py` therefore runs this
-one step as a **separate process**, in a dedicated Python 3.12 virtual
-environment, and simply skips it (with a message pointing here) if that
-environment isn't set up.
+extra. Turning the boundary + every A/B curve into a surface
+(`step_export.py`, via OpenCASCADE's free-form filling,
+`BRepOffsetAPI_MakeFilling`) needs an OpenCASCADE binding (`cadquery`'s
+`OCP`), which currently has **no Windows wheels for Python 3.13/3.14** —
+only up to 3.12. `section_stl.py` therefore runs this one step as a
+**separate process**, in a dedicated Python 3.12 virtual environment, and
+simply skips it (with a message pointing here) if that environment isn't
+set up.
 
 One-time setup, from this folder:
 
@@ -98,31 +100,33 @@ bug in this project. Once Smart App Control is fully "On" (not
 reinstalling Windows — check Settings → Privacy & security → Windows
 Security → App & browser control before assuming that's your only option.
 
-**Current scope**: only the *interior* grid cells (bounded by 4 curve
-segments) are filled with a surface patch today. The outer boundary ring
-isn't stitched yet, so the exported shell is open along the scan's edge
-rather than a fully closed solid.
+**Why one surface, not a patch per grid cell**: an earlier version built
+one small Coons-style patch per A×B grid cell and sewed them into a
+shell. On a real scan that came out visibly faceted, occasionally shot a
+patch into a wild spike, and produced faces SolidWorks' own import
+diagnostics kept flagging as invalid even after this project's own
+checks passed them — and a tangent-continuity (G1) fix for the faceted
+look turned out to need OpenCASCADE settings that made a single cell
+take minutes to build. A single surface, with every A/B curve fed in as
+a *soft guide* rather than a hard per-cell boundary, sidesteps all of
+that: confirmed directly against OCP, a sharp local fold's amplitude
+survives at only a few percent in the resulting surface even at
+aggressive settings, while the general shape away from that fold still
+tracks the real curve network closely — exactly "smooth surface,
+overall shape over local wrinkle fidelity", which is also what this
+project's own downstream use (flattening the result in a tool like
+Wrapstyler) wants.
 
-Adjacent patches only share positional (C0) continuity, not tangent (G1),
-so the result can look faceted rather than perfectly smooth — a
-tangent-matching version was tried and dropped as impractical (no
-measurable effect at OpenCASCADE's default settings, minutes per cell
-once cranked up enough to matter; see `step_export.py`). **Use a finer
-A/B section count** (more, smaller sections) in the parameter form for a
-smoother-looking result — same principle as a denser mesh reading as
-smoother. Cells with a geometrically invalid fill (typically at a
-fold/defect in the scan) are detected and skipped, reported by name
-rather than silently exported.
+**Smoothing tolerance**: the parameter form's "Smoothing tolerance (mm)"
+field (shown once plane B is selected) is the main knob for how
+aggressively small local folds/wrinkles get smoothed away — larger
+values smooth more (and build faster); smaller values follow the scan
+more closely. 2–5 mm is a reasonable starting point; the field is right
+there in the same form as the other reconstruction settings, so it's
+easy to re-run with a different value and compare.
 
-Cell edges are also used as-is from `all_section_data`/the curve
-snapshot rather than being re-fit into a genuinely smooth spline before
-building the surface — `step_export.py` fits an approximating (not
-interpolating) B-spline near each edge's points instead of threading
-through every one of them exactly, which is what removed a "torn,
-raw-looking" surface on a real scan.
-
-`section_stl.py` also exports `sections_3d/boundary_loop.dxf`: a single
-closed spline through the ordered open endpoints of every A/B curve —
-the outline of the scanned patch — built from the same full-resolution
-curve snapshot the STEP export uses, not from reconstruction method 2's
-simplified curves.
+`section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
+includes the same spline in `sections_main_3d.dxf`): a single closed
+spline through the ordered open endpoints of every A/B curve — the
+outline of the scanned patch, and the same boundary the STEP surface is
+built from.

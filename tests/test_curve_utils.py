@@ -4,14 +4,12 @@ import pytest
 from curve_utils import (
     UNIT_TO_MM,
     build_simple_spline_curve,
-    build_surface_grid,
     collect_curve_endpoints,
     find_curve_crossings,
     fit_portion_adaptive,
     order_boundary_loop,
     reconstruct_curve_piecewise,
     resample,
-    segment_curve_at_indices,
     smooth_curve,
     stitch_curve_fragments,
 )
@@ -253,49 +251,6 @@ def test_build_simple_spline_curve_with_no_intersections_returns_endpoints():
 
 
 # --------------------------------------------------------------
-# segment_curve_at_indices
-# --------------------------------------------------------------
-
-def test_segment_curve_at_indices_splits_into_expected_pieces():
-    points = np.array([[i, 0, 0] for i in range(10)], dtype=float)
-
-    segments = segment_curve_at_indices(points, [3, 6])
-
-    assert len(segments) == 3
-    np.testing.assert_allclose(segments[0], points[0:4])
-    np.testing.assert_allclose(segments[1], points[3:7])
-    np.testing.assert_allclose(segments[2], points[6:10])
-
-
-def test_segment_curve_at_indices_segments_share_boundary_points():
-    points = np.array([[i, 0, 0] for i in range(8)], dtype=float)
-
-    segments = segment_curve_at_indices(points, [2, 5])
-
-    for a, b in zip(segments, segments[1:]):
-        np.testing.assert_allclose(a[-1], b[0])
-
-
-def test_segment_curve_at_indices_ignores_duplicates_and_out_of_range():
-    points = np.array([[i, 0, 0] for i in range(6)], dtype=float)
-
-    segments = segment_curve_at_indices(points, [3, 3, -1, 99])
-
-    assert len(segments) == 2
-    np.testing.assert_allclose(segments[0], points[0:4])
-    np.testing.assert_allclose(segments[1], points[3:6])
-
-
-def test_segment_curve_at_indices_with_no_cuts_returns_whole_curve():
-    points = np.array([[i, 0, 0] for i in range(5)], dtype=float)
-
-    segments = segment_curve_at_indices(points, [])
-
-    assert len(segments) == 1
-    np.testing.assert_allclose(segments[0], points)
-
-
-# --------------------------------------------------------------
 # order_boundary_loop
 # --------------------------------------------------------------
 
@@ -368,230 +323,37 @@ def test_order_boundary_loop_works_regardless_of_the_patch_orientation():
 
 
 # --------------------------------------------------------------
-# build_surface_grid
+# collect_curve_endpoints
 # --------------------------------------------------------------
-#
-# A flat 3x3 lattice: A curves are horizontal lines y = 1, 2, 3
-# each sampled at x = 0..4; B curves are vertical lines x = 1, 2, 3
-# each sampled at y = 0..4. Sampling exactly on integer coordinates
-# means each crossing sits exactly on a curve point, so the
-# expected idx_a / idx_b are known exactly and every geometric
-# assertion below can be exact rather than approximate.
-
-def _make_lattice_grid_inputs():
-    all_section_data = []
-
-    for i in (1, 2, 3):
-        points = np.array([[x, i, 0] for x in range(5)], dtype=float)
-        all_section_data.append(
-            {
-                "direction": "A",
-                "number": i,
-                "main_curve_index": 0,
-                "curves": [{"points_3d": points}],
-            }
-        )
-
-    for j in (1, 2, 3):
-        points = np.array([[j, y, 0] for y in range(5)], dtype=float)
-        all_section_data.append(
-            {
-                "direction": "B",
-                "number": j,
-                "main_curve_index": 0,
-                "curves": [{"points_3d": points}],
-            }
-        )
-
-    found_intersections = []
-
-    for i in (1, 2, 3):
-        for j in (1, 2, 3):
-            found_intersections.append(
-                {
-                    "pair_id": (i, j, 0),
-                    "point": np.array([j, i, 0], dtype=float),
-                    "gap": 0.0,
-                    "idx_a": j,
-                    "idx_b": i,
-                }
-            )
-
-    return all_section_data, found_intersections
-
-
-def test_build_surface_grid_produces_the_expected_interior_cells():
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    # A 3x3 node lattice has a 2x2 grid of interior cells.
-    assert len(grid["cells"]) == 4
-
-    cells_by_corner = {
-        (c["a_i"], c["b_j"]): c for c in grid["cells"]
-    }
-    assert set(cells_by_corner) == {(1, 1), (1, 2), (2, 1), (2, 2)}
-
-    cell = cells_by_corner[(1, 1)]
-    assert cell["a_i_next"] == 2
-    assert cell["b_j_next"] == 2
-
-    np.testing.assert_allclose(cell["edge_a_lo"], [[1, 1, 0], [2, 1, 0]])
-    np.testing.assert_allclose(cell["edge_a_hi"], [[1, 2, 0], [2, 2, 0]])
-    np.testing.assert_allclose(cell["edge_b_lo"], [[1, 1, 0], [1, 2, 0]])
-    np.testing.assert_allclose(cell["edge_b_hi"], [[2, 1, 0], [2, 2, 0]])
-
-
-def test_build_surface_grid_adjacent_cells_share_exact_edge_points():
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    cells_by_corner = {
-        (c["a_i"], c["b_j"]): c for c in grid["cells"]
-    }
-
-    left = cells_by_corner[(1, 1)]
-    right = cells_by_corner[(2, 1)]
-
-    # left's "hi" edge (at a=2) must be identical to right's "lo"
-    # edge (also at a=2) -- same physical boundary between the two
-    # cells, computed independently from curve A_2's own segments.
-    np.testing.assert_allclose(left["edge_a_hi"], right["edge_a_lo"])
-
-
-def test_build_surface_grid_boundary_edges_reach_the_curve_endpoints():
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    start = grid["boundary_edges"][("A", 1, "start")]
-    end = grid["boundary_edges"][("A", 1, "end")]
-
-    np.testing.assert_allclose(start, [[0, 1, 0], [1, 1, 0]])
-    np.testing.assert_allclose(end, [[3, 1, 0], [4, 1, 0]])
-
-
-def test_build_surface_grid_handles_two_crossings_at_the_same_curve_index():
-    # Regression test: on a real (noisy/self-crossing) scan, two
-    # different crossings from the other family can land on the
-    # exact same nearest point index of a curve. build_surface_grid
-    # must not crash (it used to: IndexError in the snapping loop,
-    # since segment_curve_at_indices silently de-duplicates that
-    # index into a single boundary while the un-deduplicated hit
-    # list still expected one more segment than actually existed).
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    # A_2 x B_1 and A_2 x B_3 both snapped to the same point (index 2
-    # along A_2, i.e. x=2) instead of their own distinct x=1 / x=3.
-    for entry in found_intersections:
-        i, j, k = entry["pair_id"]
-        if i == 2 and j in (1, 3):
-            entry["idx_a"] = 2
-            entry["point"] = np.array([2, 2, 0], dtype=float)
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    # Must not raise, and must still produce a usable (if reduced)
-    # grid rather than silently corrupting data.
-    assert isinstance(grid["cells"], list)
-
-
-def test_build_surface_grid_handles_a_crossing_at_the_curve_endpoint():
-    # Regression test for the same crash, other trigger: a crossing
-    # landing exactly on the curve's own open endpoint (index 0 or
-    # n - 1), which segment_curve_at_indices treats as "already a
-    # boundary" rather than a new interior split.
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    for entry in found_intersections:
-        i, j, k = entry["pair_id"]
-        if i == 1 and j == 1:
-            entry["idx_a"] = 0  # A_1's own start point, x=0
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    assert isinstance(grid["cells"], list)
-
-
-def test_build_surface_grid_ignores_stale_idx_after_curve_rebuild():
-    # Regression test for the "0 interior grid cells found" bug:
-    # reconstruction method 2 rebuilds every main curve to a short
-    # "start + intersections + end" polyline AFTER
-    # find_all_intersections() already computed idx_a/idx_b against
-    # the long, pre-rebuild curve -- so those indices are stale by
-    # the time build_surface_grid runs. It must locate each crossing
-    # by nearest point on the CURRENT curve instead, ignoring
-    # idx_a/idx_b entirely, so a real (very wrong, out-of-range)
-    # stale index must not prevent the grid from being built.
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    for entry in found_intersections:
-        # Deliberately bogus: as if computed against a 500-point
-        # curve that no longer exists by the time this runs.
-        entry["idx_a"] = 483
-        entry["idx_b"] = 271
-
-    grid = build_surface_grid(all_section_data, found_intersections)
-
-    # Same lattice as the non-stale-index test: still finds the
-    # full 2x2 interior grid, proving idx_a/idx_b were ignored.
-    assert len(grid["cells"]) == 4
-
-
-def test_build_surface_grid_uses_curve_override_for_richer_edges():
-    # Regression test: reconstruction method 2 rebuilds every main
-    # curve to a minimal "start + intersections + end" polyline,
-    # which loses the actual scanned shape BETWEEN crossings --
-    # cell edges built from that come out flat/near-planar instead
-    # of following the real surface. curve_override lets the caller
-    # (section_stl.py, from a snapshot taken before that rebuild)
-    # supply the full-resolution curve instead.
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
-
-    # A richer version of A_2 with extra shaped points between its
-    # x=1 and x=2 crossings that a minimal 2-point segment (what
-    # all_section_data's own lattice fixture has) wouldn't carry.
-    rich_a2 = np.array(
-        [
-            [0, 2, 0], [1, 2, 0],
-            [1.3, 2, 0.5], [1.6, 2, 0.5],
-            [2, 2, 0], [3, 2, 0], [4, 2, 0],
-        ],
-        dtype=float,
-    )
-
-    grid = build_surface_grid(
-        all_section_data,
-        found_intersections,
-        curve_override={("A", 2): rich_a2},
-    )
-
-    cells_by_corner = {(c["a_i"], c["b_j"]): c for c in grid["cells"]}
-
-    # Cell (1,1)'s "hi" edge along A runs on curve A_2 between its
-    # b=1 (x=1) and b=2 (x=2) crossings -- must carry the extra
-    # shaped points from the override, not just the 2 endpoints a
-    # minimal curve would have given.
-    edge = cells_by_corner[(1, 1)]["edge_a_hi"]
-
-    assert len(edge) > 2
-    np.testing.assert_allclose(edge[0], [1, 2, 0])
-    np.testing.assert_allclose(edge[-1], [2, 2, 0])
-
-    # A_1 has no override -- must still fall back to
-    # all_section_data's own points_3d as before.
-    other_edge = cells_by_corner[(1, 1)]["edge_a_lo"]
-    np.testing.assert_allclose(other_edge, [[1, 1, 0], [2, 1, 0]])
-
 
 def test_collect_curve_endpoints_gathers_both_ends_of_every_curve():
-    all_section_data, found_intersections = _make_lattice_grid_inputs()
+    main_curves = {
+        ("A", 1): np.array([[0, 1, 0], [1, 1, 0], [2, 1, 0]], dtype=float),
+        ("A", 2): np.array([[0, 2, 0], [1, 2, 0], [2, 2, 0]], dtype=float),
+        ("B", 1): np.array([[1, 0, 0], [1, 1, 0], [1, 2, 0]], dtype=float),
+    }
 
-    grid = build_surface_grid(all_section_data, found_intersections)
+    endpoints = collect_curve_endpoints(main_curves)
 
-    endpoints = collect_curve_endpoints(grid["main_curves"])
+    # 3 curves, 2 endpoints each.
+    assert endpoints.shape == (6, 3)
 
-    # 6 curves (3 A + 3 B), 2 endpoints each.
-    assert endpoints.shape == (12, 3)
+    expected = {
+        (0, 1, 0), (2, 1, 0),
+        (0, 2, 0), (2, 2, 0),
+        (1, 0, 0), (1, 2, 0),
+    }
+    actual = {tuple(p) for p in endpoints}
+    assert actual == expected
+
+
+def test_collect_curve_endpoints_skips_degenerate_curves():
+    main_curves = {
+        ("A", 1): np.array([[0, 1, 0], [1, 1, 0]], dtype=float),
+        ("A", 2): np.array([[5, 5, 5]], dtype=float),  # single point, skipped
+    }
+
+    endpoints = collect_curve_endpoints(main_curves)
+
+    assert endpoints.shape == (2, 3)
+

@@ -17,7 +17,6 @@ from curve_utils import (
     reconstruct_curve_piecewise,
     find_curve_crossings,
     build_simple_spline_curve,
-    build_surface_grid,
     collect_curve_endpoints,
     order_boundary_loop,
 )
@@ -672,6 +671,27 @@ def ask_all_parameters(with_plane_b):
 
         row[0] += 1
 
+        add_title("Surface reconstruction (STEP export)")
+
+        add_help(
+            "How far (mm) the single reconstructed surface may "
+            "deviate from the scanned curves. Every A/B curve is "
+            "used as a soft guide, not a hard constraint, so this "
+            "mainly controls how aggressively small local folds/ "
+            "wrinkles are smoothed away while the overall shape is "
+            "still followed. Larger = smoother (good before "
+            "flattening the surface e.g. in Wrapstyler); smaller = "
+            "closer to the raw scan. Try 2-5 mm as a starting point."
+        )
+
+        surface_smoothing_var = add_field(
+            "Smoothing tolerance (mm):", 2.0
+        )
+
+    else:
+
+        surface_smoothing_var = None
+
     def on_submit():
 
         try:
@@ -739,6 +759,21 @@ def ask_all_parameters(with_plane_b):
                 method_var.get() if with_plane_b else 1
             )
 
+            if with_plane_b:
+
+                result["surface_smoothing_mm"] = float(
+                    surface_smoothing_var.get()
+                )
+
+                if result["surface_smoothing_mm"] <= 0:
+                    raise ValueError(
+                        "Surface smoothing tolerance must be > 0."
+                    )
+
+            else:
+
+                result["surface_smoothing_mm"] = None
+
         except ValueError as exc:
 
             messagebox.showerror("Invalid input", str(exc))
@@ -785,6 +820,7 @@ ideal_curve_strength = parameters["ideal_curve_strength"]
 max_polynomial_degree = parameters["max_polynomial_degree"]
 r2_target = parameters["r2_target"]
 reconstruction_method = parameters["reconstruction_method"]
+surface_smoothing_mm = parameters["surface_smoothing_mm"]
 
 
 print()
@@ -837,6 +873,10 @@ if use_plane_b:
     print(
         f"Reconstruction method: {reconstruction_method} "
         f"({method_name})"
+    )
+
+    print(
+        f"Surface smoothing tolerance: {surface_smoothing_mm:.2f} mm"
     )
 
 
@@ -2545,21 +2585,29 @@ if boundary_loop_points is not None:
 # 14. SURFACE RECONSTRUCTION (STEP EXPORT)
 # ============================================================
 #
-# Builds one smooth surface patch per interior cell of the A x B
-# curve grid (curve_utils.build_surface_grid) and sews them into
-# a shell, exported as STEP -- a finished surface model without
-# going through SolidWorks. Needs plane B: a single-direction cut
-# (3 points) has no perpendicular curve family to build a grid
-# with. Runs as a SEPARATE PROCESS in the dedicated .venv312 (see
-# README): the OpenCASCADE bindings this needs have no Windows
-# wheels for this script's own Python version, so they can't be
-# imported into this process directly.
+# Builds ONE continuous surface through the boundary loop and every
+# A/B section curve (curve_utils.order_boundary_loop /
+# rich_main_curves), exported as STEP -- a finished surface model
+# without going through SolidWorks. Needs plane B: a single-direction
+# cut (3 points) has no perpendicular curve family, and no closed
+# boundary loop to build from. Runs as a SEPARATE PROCESS in the
+# dedicated .venv312 (see README): the OpenCASCADE bindings this
+# needs have no Windows wheels for this script's own Python version,
+# so they can't be imported into this process directly.
 #
-# Current scope: only interior grid cells are filled. The outer
-# boundary ring is not stitched yet, so the exported shell is open
-# along the scan's perimeter rather than a fully closed solid.
+# This used to be a per-grid-cell patchwork (one small Coons-style
+# patch per A x B cell, sewn into a shell). On a real scan that came
+# out visibly faceted, with occasional wild "spike" patches, and
+# faces SolidWorks kept flagging as invalid on import even after this
+# project's own checks passed them. A single surface, with every
+# curve as a SOFT guide rather than a hard per-cell boundary, avoids
+# all of that by construction -- see step_export.py for the direct
+# OCP probing behind that choice, including confirmation that a
+# sharp local fold only survives at a few percent of its amplitude,
+# which is what this project's actual goal (flattening the result in
+# Wrapstyler) wants: overall shape over local wrinkle fidelity.
 
-if use_plane_b:
+if use_plane_b and boundary_loop_points is not None:
 
     print()
     print("======================================")
@@ -2588,68 +2636,54 @@ if use_plane_b:
 
     else:
 
-        surface_grid = build_surface_grid(
-            all_section_data,
-            found_intersections,
-            curve_override=rich_main_curves
+        surface_data = {
+            "boundary_loop": boundary_loop_points,
+            "interior_curves": list(rich_main_curves.values()),
+            "smoothing_tolerance_mm": surface_smoothing_mm
+        }
+
+        data_pickle_path = os.path.join(
+            output_dir,
+            "surface_curves.pickle"
         )
 
-        print(
-            f"  {len(surface_grid['cells'])} interior grid "
-            f"cell(s) found."
+        with open(data_pickle_path, "wb") as f:
+            pickle.dump(surface_data, f)
+
+        step_path = os.path.join(
+            output_dir,
+            "reconstructed_surface.step"
         )
 
-        if not surface_grid["cells"]:
+        result = subprocess.run(
+            [
+                venv_python,
+                step_export_script,
+                data_pickle_path,
+                step_path
+            ],
+            capture_output=True,
+            text=True
+        )
 
-            print(
-                "  Skipped: no interior A x B grid cell was "
-                "found (need at least a 2x2 crossing grid)."
-            )
+        if result.stdout:
+            print(result.stdout)
+
+        if result.returncode != 0:
+
+            print("  STEP export failed:")
+            print(result.stderr)
 
         else:
 
-            grid_pickle_path = os.path.join(
-                output_dir,
-                "surface_grid.pickle"
-            )
-
-            with open(grid_pickle_path, "wb") as f:
-                pickle.dump(surface_grid, f)
-
-            step_path = os.path.join(
-                output_dir,
-                "reconstructed_surface.step"
-            )
-
-            result = subprocess.run(
-                [
-                    venv_python,
-                    step_export_script,
-                    grid_pickle_path,
-                    step_path
-                ],
-                capture_output=True,
-                text=True
-            )
-
-            if result.stdout:
-                print(result.stdout)
-
-            if result.returncode != 0:
-
-                print("  STEP export failed:")
-                print(result.stderr)
-
-            else:
-
-                print(f"  {step_path}")
+            print(f"  {step_path}")
 
 else:
 
     print()
     print(
         "Plane B not used - surface reconstruction / STEP export "
-        "skipped (needs the A x B curve grid)."
+        "skipped (needs the A x B curve grid and its boundary loop)."
     )
 
 

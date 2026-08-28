@@ -1,36 +1,39 @@
 """
-Builds the surface-reconstruction shell from the A x B curve grid
-(see curve_utils.build_surface_grid) and writes it to STEP.
+Builds ONE continuous surface reconstruction from the scanned patch's
+boundary loop and its A x B section curves, and writes it to STEP.
 
 This module needs cadquery's OCP (OpenCASCADE) bindings, which have no
 Windows wheels for Python 3.13/3.14 -- see the project README for the
 dedicated .venv312 this runs in. section_stl.py itself keeps running on
 whatever Python already has pyvista/vtk working, and invokes this
-module as a SEPARATE PROCESS in .venv312, handing it the grid data
+module as a SEPARATE PROCESS in .venv312, handing it the curve data
 through a pickle file -- so the interactive GUI pipeline and the
 CAD-kernel-dependent surface export never have to share one Python
 process (this also happens to route around a Windows Smart App Control
 policy on the original dev machine that blocks vtk specifically inside
 .venv312, see README).
 
-Run directly: python step_export.py <grid.pickle> <output.step>
+Run directly: python step_export.py <curves.pickle> <output.step>
 
-Current scope: builds a surface patch for every INTERIOR grid cell
-(bounded by 4 curve segments, 2 from each family). The outer boundary
-ring (the triangular cells against the patch's perimeter loop) is not
-filled yet -- the exported shell is open along the scan's outer edge
-rather than a fully closed solid.
-
-Adjacent patches only share positional (C0) continuity, not tangent
-(G1) -- on a real scan this reads as a faceted, "geodesic dome" look
-rather than one smooth surface. A G1 version (each new patch built
-against its already-built neighbour as a continuity reference) was
-tried and dropped: with OpenCASCADE's default settings it had no
-measurable effect on tangent matching, and cranking up the iteration
-count enough to matter made a single cell take minutes to build. The
-practical fix for the faceted look is a finer A/B section count in
-section_stl.py (smaller, more numerous cells read as smooth from a
-normal viewing distance), not a change here.
+History: the first version of this module built one small Coons-style
+patch per grid cell (see curve_utils.build_surface_grid) and sewed them
+into a shell. On a real scan that produced a visibly faceted result,
+occasional wild "spike" patches, and faces SolidWorks' own import
+diagnostics kept flagging as invalid even after this module's own
+checks passed them. Rebuilt as a SINGLE surface instead: one call to
+OpenCASCADE's free-form filling (BRepOffsetAPI_MakeFilling), with the
+boundary loop as the bounding wire and every A/B curve as an internal
+guide curve. Probed directly against OCP before relying on it here:
+this scales fine (a realistic 22-curve, 500-points-each network plus a
+~400-point boundary builds in ~0.02s), and -- relevant to this
+project's actual goal of flattening the result in Wrapstyler --
+internal guide curves are inherently treated as SOFT constraints by
+this algorithm: a sharp local fold's amplitude was retained at only
+1-3% in the resulting surface even at aggressive settings, while the
+overall shape away from that fold stayed close to the true curve
+network. In other words this naturally smooths away small local
+wrinkles while still following the scan's general shape, without
+needing the harder-to-tune per-patch approach.
 """
 
 import pickle
@@ -42,74 +45,33 @@ from OCP.gp import gp_Pnt
 from OCP.TColgp import TColgp_Array1OfPnt
 from OCP.GeomAPI import GeomAPI_PointsToBSpline
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_Sewing
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
-from OCP.Bnd import Bnd_Box
-from OCP.BRepBndLib import BRepBndLib
 from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
 
 
-# Maximum amount a fitted patch's own bounding box may extend beyond
-# its input boundary points' bounding box, as a multiple of that
-# box's diagonal. BRepCheck_Analyzer (used below) only catches
-# topological invalidity such as self-intersection -- a free-form
-# fill can still be "valid" by that measure while shooting off into
-# a long, wild spike far outside the cell it was asked to fill (seen
-# on a real scan, likely from sparse/degenerate input near a fold).
-# This is a plain sanity check on the fitted surface's own extent,
-# not a topology check.
-MAX_BBOX_EXPANSION_FACTOR = 1.5
+# Default "how much may the surface deviate from the raw curve
+# points" tolerance, in mm -- used both to fit each curve into a
+# smooth edge (removing residual scan noise) and, more importantly,
+# as BRepOffsetAPI_MakeFilling's own Tol3D. This is the main knob for
+# how aggressively small local folds/wrinkles get smoothed away:
+# larger = smoother (loses more local detail, keeps the general
+# shape), smaller = follows the scanned curves more closely. Exposed
+# as a real parameter (see build_single_surface / main()), this is
+# just the fallback default. section_stl.py's own parameter form
+# lets this be set per run.
+DEFAULT_SMOOTHING_TOLERANCE_MM = 2.0
 
 
-def _face_exceeds_input_bounds(face, edge_point_lists):
-
-    all_points = np.vstack(edge_point_lists)
-
-    input_min = all_points.min(axis=0)
-    input_max = all_points.max(axis=0)
-
-    diagonal = float(np.linalg.norm(input_max - input_min))
-    margin = max(diagonal, 1e-6) * MAX_BBOX_EXPANSION_FACTOR
-
-    box = Bnd_Box()
-    BRepBndLib.Add_s(face, box)
-
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
-
-    face_min = np.array([xmin, ymin, zmin])
-    face_max = np.array([xmax, ymax, zmax])
-
-    return bool(
-        np.any(face_min < input_min - margin)
-        or
-        np.any(face_max > input_max + margin)
-    )
-
-
-# How far (mm) the fitted curve is allowed to deviate from the raw
-# scan points. Section curves are already Laplacian-smoothed by
-# section_stl.py, but still carry real per-point digitisation noise;
-# interpolating THROUGH every one of those points (the first version
-# of this module did, via GeomAPI_Interpolate) forces the curve --
-# and then the filling surface built from it -- to wiggle to hit
-# each one exactly, which is what showed up as a "torn", ragged
-# surface on a real scan. Approximating within a small tolerance
-# instead (GeomAPI_PointsToBSpline) fits a genuinely smooth curve
-# near the points rather than through all of them: on a synthetic
-# noisy test curve this cut a "wiggliness" metric by ~100x (82
-# control points down to 4) for a barely visible 0.2mm deviation.
-CURVE_FIT_TOLERANCE_MM = 0.3
-
-
-def curve_from_points(points):
+def curve_from_points(points, tolerance_mm):
     """
     Fits a smooth, approximating B-spline curve near an ordered list
-    of 3D points (within CURVE_FIT_TOLERANCE_MM) -- see the module
-    note above for why this replaced an exact interpolation.
+    of 3D points (within `tolerance_mm`), rather than interpolating
+    through every one of them exactly -- see the module note above.
     """
 
     n = len(points)
@@ -124,121 +86,80 @@ def curve_from_points(points):
         3,
         8,
         GeomAbs_Shape.GeomAbs_C2,
-        CURVE_FIT_TOLERANCE_MM
+        tolerance_mm
     )
 
     return fitter.Curve()
 
 
-def edge_from_points(points):
-    return BRepBuilderAPI_MakeEdge(curve_from_points(points)).Edge()
+def edge_from_points(points, tolerance_mm):
+    return BRepBuilderAPI_MakeEdge(
+        curve_from_points(points, tolerance_mm)
+    ).Edge()
 
 
-def face_from_edges(edge_point_lists):
+def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_mm):
     """
-    Builds one smooth surface patch (a TopoDS_Face) passing through
-    3 or 4 boundary curves, using OpenCASCADE's general-purpose
-    surface filling (BRepOffsetAPI_MakeFilling). Unlike the more
-    rigid GeomFill_BSplineCurves Coons-patch API, this one doesn't
-    require the boundary curves to be given in any particular order
-    or orientation, and fills a 3-edge (triangular) boundary exactly
-    the same way as a 4-edge interior cell -- confirmed by probing
-    both cases directly against OCP before relying on it here.
+    Builds ONE TopoDS_Face covering the whole scanned patch: the
+    closed `boundary_points` loop is the surface's bounding wire,
+    and every curve in `interior_curves` (each an (N, 3) point
+    array -- typically every A_i and B_j section curve) is added as
+    an internal guide curve the surface is pulled towards, not a
+    hard boundary. See the module docstring for why that specific
+    combination (one free-form fill, boundary + internal guides)
+    was chosen over a per-cell patchwork.
 
-    Only positional (C0) continuity is requested between adjacent
-    cells; this can leave a visible tangent kink at cell boundaries.
-    A tangent-matching (G1) version of this was tried and dropped:
-    with OpenCASCADE's default iteration count it had no measurable
-    effect, and cranking iterations up enough to matter made a
-    single cell take minutes to build -- not viable for a real grid.
-    A finer A/B section count (smaller, more numerous cells) is the
-    practical way to make the facets read as smooth from a normal
-    viewing distance, same principle as a denser mesh looking
-    smoother.
-
-    Raises RuntimeError if OpenCASCADE either fails to fill the
-    boundary at all, produces a geometrically invalid face (e.g.
-    self-intersecting) -- checked directly with BRepCheck_Analyzer
-    rather than trusting IsDone() alone, since a "successful" fill
-    can still be invalid B-rep on messy/twisted input curves (this
-    is what showed up as SolidWorks import diagnostics flagging
-    faces as invalid on a real, folded scan) -- or produces a face
-    that is topologically fine but shoots far outside its own
-    boundary curves (see _face_exceeds_input_bounds), which showed
-    up as a long, wild spike on that same real scan.
+    Raises RuntimeError if OpenCASCADE fails to build the surface,
+    or builds one that is not a topologically valid B-rep face
+    (checked with BRepCheck_Analyzer rather than trusting the
+    algorithm's own "done" status alone).
     """
 
-    filler = BRepOffsetAPI_MakeFilling()
+    filler = BRepOffsetAPI_MakeFilling(
+        3, 15, 3, False, 1e-5,
+        smoothing_tolerance_mm, 0.01, 0.1, 8, 9
+    )
 
-    for points in edge_point_lists:
-        filler.Add(edge_from_points(points), GeomAbs_C0)
+    boundary_points = np.asarray(boundary_points, dtype=float)
+
+    # The boundary must be a genuinely CLOSED loop (its own start and
+    # end coinciding) to bound a region at all -- an open curve fed
+    # as IsBound=True is topologically ambiguous and was confirmed
+    # (empirically, against a real 44-point boundary loop) to make
+    # OpenCASCADE build a "successful" but geometrically invalid
+    # face. Closed explicitly here so callers don't have to remember
+    # to append the first point back on themselves.
+    if not np.allclose(boundary_points[0], boundary_points[-1]):
+        boundary_points = np.vstack([boundary_points, boundary_points[0:1]])
+
+    boundary_edge = edge_from_points(boundary_points, smoothing_tolerance_mm)
+    filler.Add(boundary_edge, GeomAbs_C0, True)
+
+    for curve_points in interior_curves:
+
+        if len(curve_points) < 2:
+            continue
+
+        edge = edge_from_points(curve_points, smoothing_tolerance_mm)
+        filler.Add(edge, GeomAbs_C0, False)
 
     filler.Build()
 
     if not filler.IsDone():
         raise RuntimeError(
-            "OpenCASCADE could not fill this cell's boundary "
-            "curves into a surface."
+            "OpenCASCADE could not fill the boundary loop and "
+            "guide curves into a single surface."
         )
 
     face = TopoDS.Face_s(filler.Shape())
 
     if not BRepCheck_Analyzer(face).IsValid():
         raise RuntimeError(
-            "OpenCASCADE filled this cell but the resulting "
-            "surface is geometrically invalid (likely "
-            "self-intersecting, probably from a fold/defect in "
-            "the scan at this location)."
-        )
-
-    if _face_exceeds_input_bounds(face, edge_point_lists):
-        raise RuntimeError(
-            "OpenCASCADE filled this cell but the resulting "
-            "surface extends far outside its own boundary curves "
-            "(a wild spike), likely from sparse/degenerate input "
-            "near a fold or defect in the scan."
+            "OpenCASCADE built a surface but it is geometrically "
+            "invalid (likely self-intersecting)."
         )
 
     return face
-
-
-def build_shell(cells):
-    """
-    Builds one face per interior grid cell (see
-    curve_utils.build_surface_grid) and sews them all into a shell.
-    Returns (shell, failures), where failures is a list of
-    (a_i, b_j, error_message) for any cell OpenCASCADE either
-    couldn't fill at all, or filled into a geometrically invalid
-    face (see face_from_edges) -- reported to the user rather than
-    aborting the whole export or silently including bad geometry.
-    """
-
-    sewing = BRepBuilderAPI_Sewing(1e-3)
-
-    failures = []
-    built = 0
-
-    for cell in cells:
-
-        edges = [
-            cell["edge_a_lo"],
-            cell["edge_a_hi"],
-            cell["edge_b_lo"],
-            cell["edge_b_hi"],
-        ]
-
-        try:
-            face = face_from_edges(edges)
-        except RuntimeError as exc:
-            failures.append((cell["a_i"], cell["b_j"], str(exc)))
-            continue
-
-        sewing.Add(face)
-        built += 1
-
-    sewing.Perform()
-
-    return sewing.SewedShape(), built, failures
 
 
 def write_step(shape, output_path):
@@ -272,48 +193,40 @@ def write_step(shape, output_path):
         )
 
 
-def build_step_surfaces(grid, output_path):
+def build_step_surfaces(data, output_path):
     """
-    Entry point: takes the dict returned by
-    curve_utils.build_surface_grid and writes the reconstructed
-    surface shell to `output_path`. Returns (built_count, failures).
+    Entry point: takes the dict pickled by section_stl.py
+    ({"boundary_loop": ..., "interior_curves": ...,
+    "smoothing_tolerance_mm": ...}) and writes the single
+    reconstructed surface to `output_path`.
     """
 
-    shape, built, failures = build_shell(grid["cells"])
+    face = build_single_surface(
+        data["boundary_loop"],
+        data["interior_curves"],
+        data.get("smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM)
+    )
 
-    if built == 0:
-        raise RuntimeError(
-            "No cell could be turned into a surface -- nothing to export."
-        )
-
-    write_step(shape, output_path)
-
-    return built, failures
+    write_step(face, output_path)
 
 
 def main():
 
     if len(sys.argv) != 3:
         print(
-            "Usage: python step_export.py <grid.pickle> <output.step>",
+            "Usage: python step_export.py <curves.pickle> <output.step>",
             file=sys.stderr
         )
         raise SystemExit(2)
 
-    grid_path, output_path = sys.argv[1], sys.argv[2]
+    data_path, output_path = sys.argv[1], sys.argv[2]
 
-    with open(grid_path, "rb") as f:
-        grid = pickle.load(f)
+    with open(data_path, "rb") as f:
+        data = pickle.load(f)
 
-    built, failures = build_step_surfaces(grid, output_path)
+    build_step_surfaces(data, output_path)
 
-    for a_i, b_j, message in failures:
-        print(f"  Warning: cell A{a_i} x B{b_j} could not be filled: {message}")
-
-    print(
-        f"{built}/{built + len(failures)} surface patch(es) "
-        f"written to {output_path}"
-    )
+    print(f"Surface written to {output_path}")
 
 
 if __name__ == "__main__":

@@ -6,13 +6,11 @@ this whole module is skipped rather than failing.
 
 Deliberately does NOT import curve_utils (or anything that pulls in
 scipy/vtk): step_export.py itself only needs OCP + the standard
-library, and this test's grid fixture is built by hand to match
-build_surface_grid's output schema, to keep that boundary real. On
-this project's original dev machine, Windows Smart App Control blocks
-several freshly pip-installed native packages inside .venv312 (vtk,
-scipy's compiled extensions) but not OCP -- importing curve_utils here
-would hit that wall for a reason that has nothing to do with what this
-test is meant to check.
+library. On this project's original dev machine, Windows Smart App
+Control blocks several freshly pip-installed native packages inside
+.venv312 (vtk, scipy's compiled extensions) but not OCP -- importing
+curve_utils here would hit that wall for a reason that has nothing to
+do with what this test is meant to check.
 """
 
 import numpy as np
@@ -20,108 +18,144 @@ import pytest
 
 pytest.importorskip("OCP")
 
-from step_export import build_step_surfaces, face_from_edges, _face_exceeds_input_bounds
+from step_export import build_single_surface, build_step_surfaces
 
 
-def _lattice_grid():
-    # Same flat 3x3 lattice as tests/test_curve_utils.py's
-    # build_surface_grid tests, but assembled directly into the
-    # {"cells": [...]} shape build_step_surfaces expects.
-    cells = []
-
-    for a_i in (1, 2):
-        for b_j in (1, 2):
-            cells.append(
-                {
-                    "a_i": a_i,
-                    "a_i_next": a_i + 1,
-                    "b_j": b_j,
-                    "b_j_next": b_j + 1,
-                    "edge_a_lo": np.array(
-                        [[b_j, a_i, 0], [b_j + 1, a_i, 0]], dtype=float
-                    ),
-                    "edge_a_hi": np.array(
-                        [[b_j, a_i + 1, 0], [b_j + 1, a_i + 1, 0]],
-                        dtype=float,
-                    ),
-                    "edge_b_lo": np.array(
-                        [[b_j, a_i, 0], [b_j, a_i + 1, 0]], dtype=float
-                    ),
-                    "edge_b_hi": np.array(
-                        [[b_j + 1, a_i, 0], [b_j + 1, a_i + 1, 0]],
-                        dtype=float,
-                    ),
-                }
-            )
-
-    return {"cells": cells}
+def _dome_z(x, y):
+    return 0.3 * np.sin(x * 0.7) * np.cos(y * 0.5)
 
 
-def test_build_step_surfaces_writes_a_valid_step_file(tmp_path):
-    grid = _lattice_grid()
+def _synthetic_patch():
+    # A gently curved 4x4 patch: 5 A-direction curves, 5 B-direction
+    # curves, and a closed boundary loop around the perimeter --
+    # standing in for section_stl.py's rich_main_curves +
+    # boundary_loop_points on a real scan.
+    interior_curves = []
+
+    for x in np.linspace(0, 4, 5):
+        ys = np.linspace(0, 4, 30)
+        interior_curves.append(
+            np.column_stack([np.full_like(ys, x), ys, _dome_z(x, ys)])
+        )
+
+    for y in np.linspace(0, 4, 5):
+        xs = np.linspace(0, 4, 30)
+        interior_curves.append(
+            np.column_stack([xs, np.full_like(xs, y), _dome_z(xs, y)])
+        )
+
+    boundary = []
+    for x in np.linspace(0, 4, 15):
+        boundary.append([x, 0, _dome_z(x, 0)])
+    for y in np.linspace(0, 4, 15)[1:]:
+        boundary.append([4, y, _dome_z(4, y)])
+    for x in np.linspace(4, 0, 15)[1:]:
+        boundary.append([x, 4, _dome_z(x, 4)])
+    for y in np.linspace(4, 0, 15)[1:]:
+        boundary.append([0, y, _dome_z(0, y)])
+    boundary.append(boundary[0])
+
+    return np.array(boundary), interior_curves
+
+
+def test_build_single_surface_produces_one_valid_face():
+    boundary, interior_curves = _synthetic_patch()
+
+    face = build_single_surface(boundary, interior_curves, smoothing_tolerance_mm=0.3)
+
+    assert face is not None
+
+
+def test_build_single_surface_closes_an_open_boundary_loop():
+    # Regression test: order_boundary_loop's output (what
+    # section_stl.py actually passes in) is NOT closed -- its own
+    # first point isn't repeated at the end. Feeding that straight
+    # into OpenCASCADE as a bounding wire built, but into a
+    # geometrically invalid face, confirmed directly against a real
+    # 44-point boundary loop from an 11x11 section grid.
+    # build_single_surface must close it itself.
+    _, interior_curves = _synthetic_patch()
+
+    open_boundary = np.array(
+        [[0, 0, 0], [4, 0, 0.1], [4, 4, 0], [0, 4, -0.1]], dtype=float
+    )
+    assert not np.allclose(open_boundary[0], open_boundary[-1])
+
+    face = build_single_surface(
+        open_boundary, interior_curves, smoothing_tolerance_mm=0.3
+    )
+
+    assert face is not None
+
+
+def test_build_step_surfaces_writes_a_valid_step_file_with_one_face(tmp_path):
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "boundary_loop": boundary,
+        "interior_curves": interior_curves,
+        "smoothing_tolerance_mm": 0.3,
+    }
 
     output_path = tmp_path / "surface.step"
 
-    built, failures = build_step_surfaces(grid, str(output_path))
+    build_step_surfaces(data, str(output_path))
 
-    assert built == 4
-    assert failures == []
     assert output_path.exists()
 
     content = output_path.read_text(encoding="utf-8", errors="ignore")
 
-    assert "ADVANCED_FACE" in content
+    assert content.count("ADVANCED_FACE") == 1
     assert "MILLI" in content and "METRE" in content
 
 
-def test_face_from_edges_rejects_a_self_crossing_boundary():
-    # Regression test: on a real folded scan, some cells end up with
-    # degenerate/self-intersecting boundary curves. OpenCASCADE can
-    # "successfully" fill these (IsDone() True) while producing a
-    # geometrically invalid face -- this showed up as SolidWorks
-    # import diagnostics flagging faces as invalid. face_from_edges
-    # must catch this itself (via BRepCheck_Analyzer) rather than
-    # silently exporting bad geometry.
-    bowtie_edges = [
-        [[0, 0, 0], [1, 1, 0]],
-        [[1, 1, 0], [1, 0, 0]],
-        [[1, 0, 0], [0, 1, 0]],
-        [[0, 1, 0], [0, 0, 0]],
-    ]
+def test_build_single_surface_smooths_a_sharp_local_fold():
+    # The core reason this project moved from a per-cell patchwork to
+    # one global surface: internal guide curves should be treated as
+    # SOFT constraints, so a sharp local fold gets smoothed away
+    # rather than reproduced -- confirmed by direct OCP probing
+    # before relying on it (see step_export.py's module docstring).
+    # This encodes that finding as a regression test: the fold's
+    # amplitude must survive at only a small fraction in the surface.
+    fold_center = 2.0
+    fold_amplitude = 0.8
 
-    try:
-        face_from_edges(bowtie_edges)
-    except RuntimeError:
-        pass
-    else:
-        raise AssertionError(
-            "expected a RuntimeError for a self-crossing boundary"
-        )
+    def fold_bump(v):
+        if abs(v - fold_center) > 0.3:
+            return 0.0
+        return fold_amplitude * np.exp(-((v - fold_center) ** 2) / (2 * 0.1 ** 2))
 
+    interior_curves = []
 
-def test_face_exceeds_input_bounds_flags_a_far_away_face():
-    # Regression test: BRepCheck_Analyzer only catches topological
-    # invalidity (e.g. self-intersection). A free-form fill can
-    # still be "valid" by that measure while shooting off into a
-    # long, wild spike far outside the cell it was asked to fill --
-    # seen on a real scan, likely from sparse/degenerate input near
-    # a fold. face_from_edges must catch that shape-sanity problem
-    # too, via this bounding-box check, not just topology.
-    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+    for x in np.linspace(0, 4, 5):
+        ys = np.linspace(0, 4, 40)
+        z = _dome_z(x, ys)
+        if abs(x - fold_center) < 0.01:
+            z = z + np.array([fold_bump(y) for y in ys])
+        interior_curves.append(np.column_stack([np.full_like(ys, x), ys, z]))
 
-    input_points = [
-        np.array([[0, 0, 0], [1, 0, 0]], dtype=float),
-        np.array([[0, 1, 0], [1, 1, 0]], dtype=float),
-    ]
+    for y in np.linspace(0, 4, 5):
+        xs = np.linspace(0, 4, 40)
+        z = _dome_z(xs, y)
+        if abs(y - fold_center) < 0.01:
+            z = z + np.array([fold_bump(x) for x in xs])
+        interior_curves.append(np.column_stack([xs, np.full_like(xs, y), z]))
 
-    near_face = BRepBuilderAPI_MakeFace(
-        gp_Pln(gp_Pnt(0.5, 0.5, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
-    ).Face()
+    boundary, _ = _synthetic_patch()
 
-    far_face = BRepBuilderAPI_MakeFace(
-        gp_Pln(gp_Pnt(500, 500, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
-    ).Face()
+    face = build_single_surface(boundary, interior_curves, smoothing_tolerance_mm=0.05)
 
-    assert _face_exceeds_input_bounds(near_face, input_points) is False
-    assert _face_exceeds_input_bounds(far_face, input_points) is True
+    from OCP.gp import gp_Pnt
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.BRep import BRep_Tool
+
+    surf = BRep_Tool.Surface_s(face)
+    target = gp_Pnt(fold_center, fold_center, _dome_z(fold_center, fold_center))
+    projector = GeomAPI_ProjectPointOnSurf(target, surf)
+    nearest = projector.NearestPoint()
+
+    fold_retained = abs(nearest.Z() - _dome_z(fold_center, fold_center))
+
+    # Well under half the fold's own amplitude survives -- the sharp
+    # local feature is smoothed away, not reproduced.
+    assert fold_retained < fold_amplitude * 0.5
