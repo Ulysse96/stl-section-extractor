@@ -2771,6 +2771,42 @@ if boundary_loop_points is not None:
 
     print(boundary_path)
 
+if surface_boundary_loop_points is not None and excluded_from_surface:
+
+    # A second copy reflecting the exclusions from step 12bis --
+    # what the STEP export in step 14 actually builds the surface
+    # from. Lets the boundary be checked visually (e.g. still
+    # jagged somewhere? try excluding another section) without
+    # having to run the STEP export itself each time. Only written
+    # when something was actually excluded; otherwise it would be
+    # identical to boundary_loop.dxf above.
+
+    print()
+    print("--- boundary_loop_surface ---")
+
+    surface_boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop_surface.dxf"
+    )
+
+    doc_surface_boundary = new_dxf_document()
+    msp_surface_boundary = doc_surface_boundary.modelspace()
+
+    closed_surface_boundary_points = np.vstack(
+        [surface_boundary_loop_points, surface_boundary_loop_points[0:1]]
+    )
+
+    msp_surface_boundary.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_surface_boundary_points
+        ]
+    )
+
+    doc_surface_boundary.saveas(surface_boundary_path)
+
+    print(surface_boundary_path)
+
 
 # ============================================================
 # 14. SURFACE RECONSTRUCTION (STEP EXPORT)
