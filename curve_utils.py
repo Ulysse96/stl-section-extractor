@@ -802,6 +802,34 @@ def _uncross_loop_2opt(proj_2d, order):
     return order
 
 
+def _project_onto_best_fit_plane_2d(points):
+    """
+    PCA (via SVD): finds the 2D plane a set of 3D points is closest
+    to lying on, and returns (centroid, basis, proj_2d) -- proj_2d
+    are the points' coordinates in that plane's own 2D basis. Shared
+    by order_boundary_loop and split_boundary_and_curves_at_separator
+    so both work in the SAME 2D projection when they need to agree
+    on it (e.g. classifying points against a boundary built from the
+    same point set).
+    """
+
+    pts = np.asarray(points, dtype=float)
+
+    centroid = pts.mean(axis=0)
+
+    centered = pts - centroid
+
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+
+    basis = vh[:2]
+
+    proj_2d = np.column_stack(
+        [centered @ basis[0], centered @ basis[1]]
+    )
+
+    return centroid, basis, proj_2d
+
+
 def order_boundary_loop(points):
     """
     Orders an unordered set of 3D points that lie roughly on the
@@ -838,18 +866,10 @@ def order_boundary_loop(points):
 
     n = len(pts)
 
-    centroid = pts.mean(axis=0)
-
-    centered = pts - centroid
-
     # PCA via SVD: the two directions of largest spread define the
     # patch's own 2D plane basis, used only to detect crossings (a
     # 2D-projection concept) below -- the returned points stay 3D.
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-
-    proj_2d = np.column_stack(
-        [centered @ vh[0], centered @ vh[1]]
-    )
+    _, _, proj_2d = _project_onto_best_fit_plane_2d(pts)
 
     remaining = list(range(1, n))
     order = [0]
@@ -891,3 +911,195 @@ def collect_curve_endpoints(main_curves):
         points.append(curve_points[-1])
 
     return np.asarray(points, dtype=float)
+
+
+def _side_of_polyline_2d(point, polyline):
+    """
+    Which side of a (possibly curved) 2D polyline `point` falls on --
+    the sign of the 2D cross product against the polyline's OWN
+    nearest segment, so a curved separator is still handled locally
+    rather than by one single straight-line approximation.
+
+    Used by split_boundary_and_curves_at_separator to classify which
+    of the two regions a guide-curve point falls into, classifying
+    against the separator itself rather than a full point-in-polygon
+    test against either region's whole boundary: every guide curve's
+    own open endpoints sit ON the outer boundary by construction (see
+    collect_curve_endpoints) -- exactly the degenerate, numerically
+    unstable case a point-in-polygon test is unreliable at (confirmed
+    directly: a point coinciding with a polygon vertex classified
+    inconsistently). Points are generally far from the separator
+    except close to its own two ends, where the classification is
+    genuinely a coin flip anyway.
+    """
+
+    best_dist_sq = None
+    best_side = 0.0
+
+    for i in range(len(polyline) - 1):
+
+        a = polyline[i]
+        b = polyline[i + 1]
+
+        segment = b - a
+        to_point = point - a
+
+        segment_length_sq = segment @ segment
+
+        if segment_length_sq < 1e-12:
+            continue
+
+        t = np.clip((to_point @ segment) / segment_length_sq, 0.0, 1.0)
+        closest = a + t * segment
+
+        dist_sq = np.sum((point - closest) ** 2)
+
+        if best_dist_sq is None or dist_sq < best_dist_sq:
+            best_dist_sq = dist_sq
+            best_side = segment[0] * to_point[1] - segment[1] * to_point[0]
+
+    return best_side > 0
+
+
+def split_boundary_and_curves_at_separator(
+    boundary_loop_points, main_curves, separator_points
+):
+    """
+    Splits a disk-like patch's boundary loop and A/B guide curves
+    into two regions along a user-traced separator (e.g. where a
+    cap's visor meets its crown) -- both ends of `separator_points`
+    are snapped onto the nearest point of `boundary_loop_points`.
+    Returns a list of exactly 2 dicts, {"boundary_loop": (M, 3)
+    array, "interior_curves": [(K, 3) array, ...]}, one per region --
+    meant to be fed into step_export.py as two separate, simpler
+    surfaces instead of one surface spanning both regions' curvature
+    at once (see README: a single surface fitting a cap's near-flat
+    visor and domed crown together was the direct cause of a real,
+    confirmed-in-SolidWorks boundary-tolerance failure).
+
+    `main_curves` is a {key: points_3d} dict, e.g. section_stl.py's
+    surface_main_curves (same shape collect_curve_endpoints expects).
+    A curve entirely on one side of the separator stays whole in that
+    region; a curve crossing the separator is cut into pieces (one
+    per side) at the point where its own region classification
+    changes.
+
+    Only supports ONE separator (splitting into exactly 2 regions,
+    not N) -- deliberately scoped this way for now; see the README.
+    """
+
+    boundary_loop_points = np.asarray(boundary_loop_points, dtype=float)
+    separator_points = np.asarray(separator_points, dtype=float)
+
+    start_idx = int(np.argmin(
+        np.linalg.norm(boundary_loop_points - separator_points[0], axis=1)
+    ))
+
+    end_idx = int(np.argmin(
+        np.linalg.norm(boundary_loop_points - separator_points[-1], axis=1)
+    ))
+
+    if start_idx == end_idx:
+        raise ValueError(
+            "The separator's two ends snapped to the same boundary "
+            "point -- trace it further out, closer to two clearly "
+            "different points on the outer edge."
+        )
+
+    def arc(from_idx, to_idx):
+        # boundary_loop_points is cyclic (not itself closed -- same
+        # convention order_boundary_loop returns); walks forward from
+        # from_idx to to_idx, wrapping around the end if needed.
+        if from_idx <= to_idx:
+            return boundary_loop_points[from_idx:to_idx + 1]
+        return np.vstack([
+            boundary_loop_points[from_idx:],
+            boundary_loop_points[:to_idx + 1]
+        ])
+
+    arc_forward = arc(start_idx, end_idx)
+    arc_backward = arc(end_idx, start_idx)
+
+    # Each region's boundary is its own arc plus the separator,
+    # traversed so it closes back onto the arc's own start -- the
+    # arc's own endpoints (real boundary points, index-snapped) and
+    # the separator's own endpoints (the user's raw clicks) are only
+    # ever a few mm apart, not identical, but build_single_surface
+    # already closes a boundary loop whose own first/last points
+    # merely aren't quite coincident (see step_export.py), so this
+    # matches the same convention rather than needing special care
+    # here.
+    region_1_boundary = np.vstack([arc_forward, separator_points[-2::-1]])
+    region_2_boundary = np.vstack([arc_backward, separator_points[1:]])
+
+    # One shared 2D projection (over every point either region's
+    # boundary touches) so the separator and every guide curve point
+    # classified against it below agree on the same plane.
+    all_points = np.vstack([boundary_loop_points, separator_points])
+    centroid, basis, _ = _project_onto_best_fit_plane_2d(all_points)
+
+    def to_2d(points_3d):
+        return (np.asarray(points_3d, dtype=float) - centroid) @ basis.T
+
+    separator_2d = to_2d(separator_points)
+
+    # Which boolean _side_of_polyline_2d returns actually means
+    # "region 1" -- calibrated once against a point already known to
+    # be in region 1 (safely away from the separator itself: the
+    # middle of its own arc, not the arc's shared endpoints).
+    region_1_reference_2d = to_2d(arc_forward[len(arc_forward) // 2])
+    region_1_side = _side_of_polyline_2d(region_1_reference_2d, separator_2d)
+
+    region_1_curves = []
+    region_2_curves = []
+
+    for curve_points in main_curves.values():
+
+        curve_points = np.asarray(curve_points, dtype=float)
+
+        if len(curve_points) < 2:
+            continue
+
+        curve_2d = to_2d(curve_points)
+
+        in_region_1 = np.array([
+            _side_of_polyline_2d(p, separator_2d) == region_1_side
+            for p in curve_2d
+        ])
+
+        piece_start = 0
+
+        for i in range(1, len(curve_points)):
+
+            if in_region_1[i] != in_region_1[i - 1]:
+
+                piece = curve_points[piece_start:i]
+
+                if len(piece) >= 2:
+                    target = (
+                        region_1_curves if in_region_1[piece_start]
+                        else region_2_curves
+                    )
+                    target.append(piece)
+
+                piece_start = i
+
+        piece = curve_points[piece_start:]
+
+        if len(piece) >= 2:
+            target = (
+                region_1_curves if in_region_1[piece_start]
+                else region_2_curves
+            )
+            target.append(piece)
+
+    return [
+        {
+            "boundary_loop": region_1_boundary,
+            "interior_curves": region_1_curves,
+        },
+        {
+            "boundary_loop": region_2_boundary,
+            "interior_curves": region_2_curves,
+        },
+    ]

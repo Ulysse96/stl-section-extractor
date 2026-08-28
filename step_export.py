@@ -45,7 +45,7 @@ from OCP.gp import gp_Pnt
 from OCP.TColgp import TColgp_Array1OfPnt
 from OCP.GeomAPI import GeomAPI_PointsToBSpline, GeomAPI_ProjectPointOnSurf
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_Sewing
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRep import BRep_Tool
@@ -415,21 +415,19 @@ RETRY_TOLERANCE_FACTOR = 2.5
 MAX_RETRIES = 3
 
 
-def build_step_surfaces(data, output_path):
+def _build_region_face(region_data):
     """
-    Entry point: takes the dict pickled by section_stl.py
-    ({"boundary_loop": ..., "interior_curves": ...,
-    "smoothing_tolerance_mm": ..., "max_section_spacing_mm": ...})
-    and writes the single reconstructed surface to `output_path`.
-
-    If the fill fails at the requested smoothing tolerance, retries
-    a few times with a progressively looser one (see
-    RETRY_TOLERANCE_FACTOR/MAX_RETRIES) before giving up -- see the
-    comment above those constants for why this can help. Prints which
-    tolerance actually succeeded when a retry was needed.
+    Builds one region's face (see build_single_surface), retrying
+    with a progressively looser smoothing tolerance if the fill fails
+    (RETRY_TOLERANCE_FACTOR/MAX_RETRIES) before giving up. One
+    region's worth of what build_step_surfaces does for the whole
+    patch when it isn't split into several.
     """
 
-    tolerance = data.get("smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM)
+    tolerance = region_data.get(
+        "smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM
+    )
+    requested_tolerance = tolerance
 
     last_error = None
 
@@ -438,22 +436,20 @@ def build_step_surfaces(data, output_path):
         try:
 
             face = build_single_surface(
-                data["boundary_loop"],
-                data["interior_curves"],
+                region_data["boundary_loop"],
+                region_data["interior_curves"],
                 tolerance,
-                data["max_section_spacing_mm"]
+                region_data["max_section_spacing_mm"]
             )
 
             if attempt > 0:
                 print(
-                    f"Succeeded at a looser smoothing tolerance: "
+                    f"  Succeeded at a looser smoothing tolerance: "
                     f"{tolerance:.2f} mm (requested: "
-                    f"{data.get('smoothing_tolerance_mm', DEFAULT_SMOOTHING_TOLERANCE_MM):.2f} mm)"
+                    f"{requested_tolerance:.2f} mm)"
                 )
 
-            write_step(face, output_path)
-
-            return
+            return face
 
         except RuntimeError as exc:
 
@@ -462,7 +458,7 @@ def build_step_surfaces(data, output_path):
             if attempt < MAX_RETRIES:
 
                 print(
-                    f"Fill failed at {tolerance:.2f} mm ({exc}); "
+                    f"  Fill failed at {tolerance:.2f} mm ({exc}); "
                     f"retrying at "
                     f"{tolerance * RETRY_TOLERANCE_FACTOR:.2f} mm..."
                 )
@@ -475,6 +471,80 @@ def build_step_surfaces(data, output_path):
         f"{tolerance / RETRY_TOLERANCE_FACTOR:.2f} mm). Last error: "
         f"{last_error}"
     ) from last_error
+
+
+# How much slack to give BRepBuilderAPI_Sewing when merging faces
+# that share a seam edge (only relevant when the patch was split into
+# several regions -- see curve_utils.split_boundary_and_curves_at_
+# separator). Each region's own edge along that seam was independently
+# fit (edge_from_points) from the SAME separator points, so they
+# should already sit close together; a small multiple of the largest
+# smoothing tolerance actually used gives some margin without being
+# so loose it merges edges that aren't really the same seam.
+SEWING_TOLERANCE_FACTOR = 2.0
+
+
+def build_step_surfaces(data, output_path):
+    """
+    Entry point: takes the dict pickled by section_stl.py
+    ({"regions": [{"boundary_loop": ..., "interior_curves": ...,
+    "smoothing_tolerance_mm": ..., "max_section_spacing_mm": ...},
+    ...]}) and writes the reconstructed surface(s) to `output_path`
+    -- one region if the scanned patch wasn't split (the common
+    case), or several sewn together at their shared seam if it was
+    (see curve_utils.split_boundary_and_curves_at_separator: splitting
+    a patch whose regions have very different curvature -- e.g. a
+    cap's near-flat visor and domed crown -- into separate, individually
+    simpler surfaces, rather than asking one surface to reconcile all
+    of it at once).
+
+    Each region is built independently via _build_region_face (same
+    retry-with-looser-tolerance behaviour as always -- see the
+    comment above RETRY_TOLERANCE_FACTOR/MAX_RETRIES).
+    """
+
+    regions = data["regions"]
+
+    faces = []
+
+    for i, region_data in enumerate(regions, start=1):
+
+        if len(regions) > 1:
+            print(f"Region {i}/{len(regions)}:")
+
+        faces.append(_build_region_face(region_data))
+
+    if len(faces) == 1:
+
+        shape = faces[0]
+
+    else:
+
+        sewing_tolerance = max(
+            region_data.get(
+                "smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM
+            )
+            for region_data in regions
+        ) * SEWING_TOLERANCE_FACTOR
+
+        sewer = BRepBuilderAPI_Sewing(sewing_tolerance)
+
+        for face in faces:
+            sewer.Add(face)
+
+        sewer.Perform()
+
+        shape = sewer.SewedShape()
+
+        if not BRepCheck_Analyzer(shape).IsValid():
+            raise RuntimeError(
+                f"Sewed {len(faces)} region faces together, but the "
+                "result is not a valid shape (their shared seam "
+                "edges may not actually line up within the sewing "
+                "tolerance)."
+            )
+
+    write_step(shape, output_path)
 
 
 def main():

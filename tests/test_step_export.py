@@ -105,10 +105,12 @@ def test_build_step_surfaces_writes_a_valid_step_file_with_one_face(tmp_path):
     boundary, interior_curves = _synthetic_patch()
 
     data = {
-        "boundary_loop": boundary,
-        "interior_curves": interior_curves,
-        "smoothing_tolerance_mm": 0.3,
-        "max_section_spacing_mm": SECTION_SPACING_MM,
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
     }
 
     output_path = tmp_path / "surface.step"
@@ -209,10 +211,12 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
     boundary, interior_curves = _synthetic_patch()
 
     data = {
-        "boundary_loop": boundary,
-        "interior_curves": interior_curves,
-        "smoothing_tolerance_mm": 0.3,
-        "max_section_spacing_mm": SECTION_SPACING_MM,
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
     }
 
     output_path = tmp_path / "surface.step"
@@ -321,10 +325,12 @@ def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
     boundary, interior_curves = _synthetic_patch()
 
     data = {
-        "boundary_loop": boundary,
-        "interior_curves": interior_curves,
-        "smoothing_tolerance_mm": 0.3,
-        "max_section_spacing_mm": SECTION_SPACING_MM,
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
     }
 
     try:
@@ -333,3 +339,75 @@ def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
         assert "retries" in str(exc)
     else:
         raise AssertionError("expected a RuntimeError after exhausting retries")
+
+
+def _synthetic_two_region_patch():
+    # Two adjacent, individually-simple regions (rectangles [0,2]x
+    # [0,4] and [2,4]x[0,4] on the same dome) sharing a straight seam
+    # at x=2, built from the SAME sample points on both sides so the
+    # seam coincides -- stands in for what curve_utils.split_boundary_
+    # and_curves_at_separator hands to step_export.py once a scan is
+    # split into panels. Built directly here (not via curve_utils,
+    # which this test file avoids importing -- see the module
+    # docstring) since only step_export.py's own handling of a
+    # "regions" list needs checking, not the splitting logic itself
+    # (covered in tests/test_curve_utils.py).
+    seam = np.array(
+        [[2.0, y, _dome_z(2.0, y)] for y in np.linspace(0, 4, 15)]
+    )
+
+    def edge_x(x_from, x_to, y, n=8):
+        return [[x, y, _dome_z(x, y)] for x in np.linspace(x_from, x_to, n)]
+
+    def edge_y(x, y_from, y_to, n=8):
+        return [[x, y, _dome_z(x, y)] for y in np.linspace(y_from, y_to, n)]
+
+    def interior_curves(x_min, x_max):
+        curves = []
+        for x in np.linspace(x_min, x_max, 3):
+            ys = np.linspace(0, 4, 20)
+            curves.append(
+                np.column_stack([np.full_like(ys, x), ys, _dome_z(x, ys)])
+            )
+        return curves
+
+    region_1_boundary = np.array(
+        edge_x(0, 2, 0) + seam.tolist() + edge_x(2, 0, 4) + edge_y(0, 4, 0)
+    )
+    region_2_boundary = np.array(
+        edge_x(2, 4, 0) + edge_y(4, 0, 4) + edge_x(4, 2, 4)
+        + seam[::-1].tolist()
+    )
+
+    return [
+        {
+            "boundary_loop": region_1_boundary,
+            "interior_curves": interior_curves(0, 2),
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        },
+        {
+            "boundary_loop": region_2_boundary,
+            "interior_curves": interior_curves(2, 4),
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        },
+    ]
+
+
+def test_build_step_surfaces_sews_multiple_regions_into_one_shape(tmp_path):
+    data = {"regions": _synthetic_two_region_patch()}
+
+    output_path = tmp_path / "surface.step"
+
+    build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+
+    content = output_path.read_text(encoding="utf-8", errors="ignore")
+
+    # build_step_surfaces already raises if BRepCheck_Analyzer finds
+    # the sewn shape invalid -- reaching this point at all means the
+    # two regions' faces sewed into one valid shape sharing their
+    # seam, not just two independent faces that happen to touch.
+    assert content.count("ADVANCED_FACE") == 2

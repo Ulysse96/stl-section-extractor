@@ -183,6 +183,40 @@ much shorter secondary one, which is normal), that section is a likely
 culprit — try reducing that plane's width slightly so its outermost
 section lands back inside the object's simple, full-loop region.
 
+**Separating into panels**: even with a clean boundary and a
+reasonable-looking, check-passing surface, a real export still failed
+to import into SolidWorks ("ファイルにジオメトリ データが含まれていません" /
+no geometry data). Root cause, confirmed directly: the fitted surface's
+own boundary edge sat 14–33mm off from the requested boundary curve
+(`BRep_Tool.Tolerance_s` on the built edge, after OpenCASCADE widens it
+to stay topologically consistent) — regardless of smoothing tolerance,
+`MaxSegments`, or post-hoc tolerance repair (`ShapeFix_Shape`,
+`BRepLib.SameParameter_s` — neither could shrink it, since it reflects
+a real geometric fact, not a stale tolerance flag). OpenCASCADE's own
+validity check tolerates this; SolidWorks' (Parasolid) importer does
+not. A real cap is several separate panels (crown, visor, ...), not
+one continuous surface — asking one B-spline to reconcile a near-flat
+visor and a domed crown at once is a lot to ask of a single fit.
+
+After the "EXCLUDE SECTIONS" window, a "SEPARATE INTO PANELS" window
+opens: click a sequence of points along a seam directly on the mesh
+(e.g. where the visor meets the crown), both ends near the outer edge,
+then close the window. That seam splits the patch into two separate,
+individually simpler surfaces (`curve_utils.split_boundary_and_curves_
+at_separator`) instead of one surface spanning both regions' curvature
+— each gets its own retry-with-looser-tolerance attempt (see above),
+and the two are sewn together at the shared seam before being written
+to one STEP file. No clicks (or just one) — the default — keeps
+today's single-surface behaviour unchanged.
+
+**Only one separator is supported for now**: enough to validate a
+crown/visor-style split end to end, without building a general
+multi-seam decomposition blind, with no way to test it interactively
+against a real, complex, noisy scan. A seam fully enclosed inside
+another panel's outline (a button, a back tab — not touching the outer
+edge) isn't supported yet either; only seams whose two ends both land
+on the outer boundary.
+
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed
 spline through the ordered open endpoints of every A/B curve — the

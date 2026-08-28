@@ -19,6 +19,7 @@ from curve_utils import (
     build_simple_spline_curve,
     collect_curve_endpoints,
     order_boundary_loop,
+    split_boundary_and_curves_at_separator,
 )
 
 
@@ -1843,7 +1844,165 @@ surface_boundary_loop_points = (
 
 
 # ============================================================
-# 12ter. FIND A x B INTERSECTIONS ON THE FINAL CURVES
+# 12ter. SEPARATE INTO PANELS (optional)
+# ============================================================
+#
+# A single global surface asks one B-spline to reconcile every
+# region's curvature at once -- confirmed as the direct cause of a
+# real SolidWorks import failure ("no geometry data"): the fitted
+# surface's own boundary edge ended up 14-33mm off from the requested
+# boundary loop, regardless of smoothing tolerance, because a single
+# degree-8 fit couldn't reconcile a cap's near-flat visor and domed
+# crown at once (BRep_Tool.Tolerance_s on the built edge, confirmed
+# directly -- and neither ShapeFix_Shape nor BRepLib.SameParameter_s
+# could shrink it, since the gap is a real geometric fact, not a
+# stale tolerance flag). Tracing a seam here (e.g. where the visor
+# meets the crown) splits the patch into two simpler, individually
+# better-behaved surfaces instead -- see
+# curve_utils.split_boundary_and_curves_at_separator. Only ONE
+# separator is supported for now; see the README.
+
+separator_points = []
+
+if use_plane_b and surface_boundary_loop_points is not None:
+
+    print()
+    print("======================================")
+    print("SEPARATE INTO PANELS (optional)")
+    print("======================================")
+
+    print(
+        "Click a sequence of points along a seam on the mesh (e.g.\n"
+        "where a cap's visor meets its crown), both ends near the\n"
+        "outer edge, to reconstruct that region as its own simpler\n"
+        "surface instead of one surface for everything. Close the\n"
+        "window when done (no clicks, or just one, = one single\n"
+        "surface, as usual)."
+    )
+
+    separator_plotter = pv.Plotter(
+        window_size=(1500, 950)
+    )
+
+    separator_plotter.add_mesh(
+        mesh,
+        color="lightgray",
+        opacity=0.5
+    )
+
+    separator_plotter.add_text(
+        "SEPARATE INTO PANELS - click points along a seam, both ends "
+        "near the outer edge (optional)",
+        position="upper_left",
+        font_size=16
+    )
+
+    separator_picker = vtk.vtkCellPicker()
+    separator_picker.SetTolerance(0.001)
+
+    def separator_click(caller, event):
+
+        x, y = caller.GetEventPosition()
+
+        separator_picker.Pick(
+            x,
+            y,
+            0,
+            separator_plotter.renderer
+        )
+
+        if separator_picker.GetCellId() < 0:
+            print("No surface detected.")
+            return
+
+        point = np.array(
+            separator_picker.GetPickPosition()
+        )
+
+        separator_points.append(point)
+
+        print(
+            f"  Separator point {len(separator_points)}: "
+            f"X={point[0]:.4f}, Y={point[1]:.4f}, Z={point[2]:.4f}"
+        )
+
+        if len(separator_points) >= 2:
+
+            line = pv.lines_from_points(
+                np.array(separator_points),
+                close=False
+            )
+
+            separator_plotter.add_mesh(
+                line,
+                color="yellow",
+                line_width=5,
+                name="separator_line"
+            )
+
+        marker = pv.PolyData(
+            point.reshape(1, 3)
+        )
+
+        separator_plotter.add_mesh(
+            marker,
+            color="yellow",
+            point_size=14,
+            render_points_as_spheres=True,
+            name=f"separator_point_{len(separator_points)}"
+        )
+
+        separator_plotter.render()
+
+    separator_plotter.iren.add_observer(
+        "LeftButtonPressEvent",
+        separator_click
+    )
+
+    separator_plotter.add_axes()
+
+    separator_plotter.show()
+
+    if len(separator_points) >= 2:
+        print(f"  Separator traced ({len(separator_points)} points).")
+    else:
+        print("  No separator traced -- using one single surface.")
+        separator_points = []
+
+if surface_boundary_loop_points is None:
+
+    surface_regions = []
+
+elif len(separator_points) >= 2:
+
+    try:
+
+        surface_regions = split_boundary_and_curves_at_separator(
+            surface_boundary_loop_points,
+            surface_main_curves,
+            np.array(separator_points)
+        )
+
+    except ValueError as exc:
+
+        print(f"  Could not split into panels ({exc}); using one "
+              "single surface instead.")
+
+        surface_regions = [{
+            "boundary_loop": surface_boundary_loop_points,
+            "interior_curves": list(surface_main_curves.values())
+        }]
+
+else:
+
+    surface_regions = [{
+        "boundary_loop": surface_boundary_loop_points,
+        "interior_curves": list(surface_main_curves.values())
+    }]
+
+
+# ============================================================
+# 12quater. FIND A x B INTERSECTIONS ON THE FINAL CURVES
 # ============================================================
 #
 # Curves have now been smoothed and (optionally) reconstructed
@@ -2828,7 +2987,7 @@ elif surface_boundary_loop_points is not None:
 # 14. SURFACE RECONSTRUCTION (STEP EXPORT)
 # ============================================================
 #
-# Builds ONE continuous surface through the boundary loop and every
+# Builds a continuous surface through the boundary loop and every
 # A/B section curve (curve_utils.order_boundary_loop /
 # rich_main_curves), exported as STEP -- a finished surface model
 # without going through SolidWorks. Needs plane B: a single-direction
@@ -2837,6 +2996,11 @@ elif surface_boundary_loop_points is not None:
 # dedicated .venv312 (see README): the OpenCASCADE bindings this
 # needs have no Windows wheels for this script's own Python version,
 # so they can't be imported into this process directly.
+#
+# One surface per region in surface_regions (step 12ter above) -- by
+# default that's the whole patch as a single region (unchanged
+# behaviour), or two simpler, individually better-behaved surfaces if
+# a separator was traced, sewn together into one shape here.
 #
 # This used to be a per-grid-cell patchwork (one small Coons-style
 # patch per A x B cell, sewn into a shell). On a real scan that came
@@ -2850,7 +3014,7 @@ elif surface_boundary_loop_points is not None:
 # which is what this project's actual goal (flattening the result in
 # Wrapstyler) wants: overall shape over local wrinkle fidelity.
 
-if use_plane_b and surface_boundary_loop_points is not None:
+if use_plane_b and surface_regions:
 
     print()
     print("======================================")
@@ -2890,10 +3054,14 @@ if use_plane_b and surface_boundary_loop_points is not None:
         )
 
         surface_data = {
-            "boundary_loop": surface_boundary_loop_points,
-            "interior_curves": list(surface_main_curves.values()),
-            "smoothing_tolerance_mm": surface_smoothing_mm,
-            "max_section_spacing_mm": max_section_spacing_mm
+            "regions": [
+                {
+                    **region,
+                    "smoothing_tolerance_mm": surface_smoothing_mm,
+                    "max_section_spacing_mm": max_section_spacing_mm
+                }
+                for region in surface_regions
+            ]
         }
 
         data_pickle_path = os.path.join(

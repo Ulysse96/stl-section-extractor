@@ -12,6 +12,7 @@ from curve_utils import (
     reconstruct_curve_piecewise,
     resample,
     smooth_curve,
+    split_boundary_and_curves_at_separator,
     stitch_curve_fragments,
 )
 
@@ -411,4 +412,112 @@ def test_collect_curve_endpoints_skips_degenerate_curves():
     endpoints = collect_curve_endpoints(main_curves)
 
     assert endpoints.shape == (2, 3)
+
+
+# --------------------------------------------------------------
+# split_boundary_and_curves_at_separator
+# --------------------------------------------------------------
+
+def _square_boundary_loop():
+    # A 4x4 square's perimeter, densely enough sampled that a
+    # separator's two ends land on distinct boundary points -- stands
+    # in for order_boundary_loop's real output on a scanned patch.
+    boundary = []
+    for x in np.linspace(0, 4, 9):
+        boundary.append([x, 0, 0])
+    for y in np.linspace(0, 4, 9)[1:]:
+        boundary.append([4, y, 0])
+    for x in np.linspace(4, 0, 9)[1:]:
+        boundary.append([x, 4, 0])
+    for y in np.linspace(4, 0, 9)[1:-1]:
+        boundary.append([0, y, 0])
+    return np.array(boundary, dtype=float)
+
+
+def test_split_boundary_and_curves_at_separator_returns_two_regions():
+    boundary = _square_boundary_loop()
+    separator = np.array(
+        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
+    )
+
+    regions = split_boundary_and_curves_at_separator(boundary, {}, separator)
+
+    assert len(regions) == 2
+
+    for region in regions:
+        assert "boundary_loop" in region
+        assert "interior_curves" in region
+        # Each region's own boundary is the whole square's perimeter
+        # split roughly in half, plus the separator closing it back
+        # up -- neither region should end up with (almost) everything.
+        assert 5 < len(region["boundary_loop"]) < len(boundary) + len(separator)
+
+
+def test_split_boundary_and_curves_at_separator_keeps_a_one_sided_curve_whole():
+    boundary = _square_boundary_loop()
+    separator = np.array(
+        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
+    )
+
+    # Entirely at x=0.5 -- well left of the x=2 separator.
+    main_curves = {
+        ("A", 1): np.array(
+            [[0.5, 0, 0], [0.5, 2, 0], [0.5, 4, 0]], dtype=float
+        ),
+    }
+
+    regions = split_boundary_and_curves_at_separator(
+        boundary, main_curves, separator
+    )
+
+    curves_by_region = [r["interior_curves"] for r in regions]
+    non_empty = [c for c in curves_by_region if c]
+
+    # Only one region should have received the curve, whole (not cut).
+    assert len(non_empty) == 1
+    assert len(non_empty[0]) == 1
+    assert len(non_empty[0][0]) == 3
+
+
+def test_split_boundary_and_curves_at_separator_cuts_a_crossing_curve():
+    boundary = _square_boundary_loop()
+    separator = np.array(
+        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
+    )
+
+    # Runs straight across the separator at y=2, from x=0 to x=4.
+    crossing_curve = np.array(
+        [[0, 2, 0], [1, 2, 0], [2.5, 2, 0], [3, 2, 0], [4, 2, 0]],
+        dtype=float,
+    )
+    main_curves = {("B", 1): crossing_curve}
+
+    regions = split_boundary_and_curves_at_separator(
+        boundary, main_curves, separator
+    )
+
+    all_pieces = [
+        piece for r in regions for piece in r["interior_curves"]
+    ]
+
+    # Cut into exactly 2 pieces (one per side), together accounting
+    # for every point of the original curve.
+    assert len(all_pieces) == 2
+    assert sum(len(piece) for piece in all_pieces) == len(crossing_curve)
+
+    left_piece = min(all_pieces, key=lambda p: p[:, 0].mean())
+    right_piece = max(all_pieces, key=lambda p: p[:, 0].mean())
+
+    assert np.all(left_piece[:, 0] < 2)
+    assert np.all(right_piece[:, 0] > 2)
+
+
+def test_split_boundary_and_curves_at_separator_rejects_a_degenerate_separator():
+    boundary = _square_boundary_loop()
+
+    # Both ends snap to the same boundary point.
+    separator = np.array([[2, 0, 0], [2, 0.1, 0], [2, 0, 0]], dtype=float)
+
+    with pytest.raises(ValueError):
+        split_boundary_and_curves_at_separator(boundary, {}, separator)
 
