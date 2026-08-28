@@ -102,3 +102,14 @@ Security → App & browser control before assuming that's your only option.
 segments) are filled with a surface patch today. The outer boundary ring
 isn't stitched yet, so the exported shell is open along the scan's edge
 rather than a fully closed solid.
+
+Adjacent patches only share positional (C0) continuity, not tangent (G1),
+so the result can look faceted rather than perfectly smooth — a
+tangent-matching version was tried and dropped as impractical (no
+measurable effect at OpenCASCADE's default settings, minutes per cell
+once cranked up enough to matter; see `step_export.py`). **Use a finer
+A/B section count** (more, smaller sections) in the parameter form for a
+smoother-looking result — same principle as a denser mesh reading as
+smoother. Cells with a geometrically invalid fill (typically at a
+fold/defect in the scan) are detected and skipped, reported by name
+rather than silently exported.

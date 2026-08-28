@@ -19,8 +19,18 @@ Current scope: builds a surface patch for every INTERIOR grid cell
 (bounded by 4 curve segments, 2 from each family). The outer boundary
 ring (the triangular cells against the patch's perimeter loop) is not
 filled yet -- the exported shell is open along the scan's outer edge
-rather than a fully closed solid. See the plan notes in the repo for
-why this was scoped out of the first version.
+rather than a fully closed solid.
+
+Adjacent patches only share positional (C0) continuity, not tangent
+(G1) -- on a real scan this reads as a faceted, "geodesic dome" look
+rather than one smooth surface. A G1 version (each new patch built
+against its already-built neighbour as a continuity reference) was
+tried and dropped: with OpenCASCADE's default settings it had no
+measurable effect on tangent matching, and cranking up the iteration
+count enough to matter made a single cell take minutes to build. The
+practical fix for the faceted look is a finer A/B section count in
+section_stl.py (smaller, more numerous cells read as smooth from a
+normal viewing distance), not a change here.
 """
 
 import pickle
@@ -32,6 +42,8 @@ from OCP.GeomAPI import GeomAPI_Interpolate
 from OCP.GeomAbs import GeomAbs_C0
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_Sewing
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
+from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
@@ -67,6 +79,25 @@ def face_from_edges(edge_point_lists):
     or orientation, and fills a 3-edge (triangular) boundary exactly
     the same way as a 4-edge interior cell -- confirmed by probing
     both cases directly against OCP before relying on it here.
+
+    Only positional (C0) continuity is requested between adjacent
+    cells; this can leave a visible tangent kink at cell boundaries.
+    A tangent-matching (G1) version of this was tried and dropped:
+    with OpenCASCADE's default iteration count it had no measurable
+    effect, and cranking iterations up enough to matter made a
+    single cell take minutes to build -- not viable for a real grid.
+    A finer A/B section count (smaller, more numerous cells) is the
+    practical way to make the facets read as smooth from a normal
+    viewing distance, same principle as a denser mesh looking
+    smoother.
+
+    Raises RuntimeError if OpenCASCADE either fails to fill the
+    boundary at all, or produces a geometrically invalid face (e.g.
+    self-intersecting) -- checked directly with BRepCheck_Analyzer
+    rather than trusting IsDone() alone, since a "successful" fill
+    can still be invalid B-rep on messy/twisted input curves (this
+    is what showed up as SolidWorks import diagnostics flagging
+    faces as invalid on a real, folded scan).
     """
 
     filler = BRepOffsetAPI_MakeFilling()
@@ -82,7 +113,17 @@ def face_from_edges(edge_point_lists):
             "curves into a surface."
         )
 
-    return filler.Shape()
+    face = TopoDS.Face_s(filler.Shape())
+
+    if not BRepCheck_Analyzer(face).IsValid():
+        raise RuntimeError(
+            "OpenCASCADE filled this cell but the resulting "
+            "surface is geometrically invalid (likely "
+            "self-intersecting, probably from a fold/defect in "
+            "the scan at this location)."
+        )
+
+    return face
 
 
 def build_shell(cells):
@@ -90,9 +131,10 @@ def build_shell(cells):
     Builds one face per interior grid cell (see
     curve_utils.build_surface_grid) and sews them all into a shell.
     Returns (shell, failures), where failures is a list of
-    (a_i, b_j, error_message) for any cell OpenCASCADE could not
-    fill -- reported to the user rather than aborting the whole
-    export.
+    (a_i, b_j, error_message) for any cell OpenCASCADE either
+    couldn't fill at all, or filled into a geometrically invalid
+    face (see face_from_edges) -- reported to the user rather than
+    aborting the whole export or silently including bad geometry.
     """
 
     sewing = BRepBuilderAPI_Sewing(1e-3)

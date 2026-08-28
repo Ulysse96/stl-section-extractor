@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("OCP")
 
-from step_export import build_step_surfaces
+from step_export import build_step_surfaces, face_from_edges
 
 
 def _lattice_grid():
@@ -72,3 +72,28 @@ def test_build_step_surfaces_writes_a_valid_step_file(tmp_path):
 
     assert "ADVANCED_FACE" in content
     assert "MILLI" in content and "METRE" in content
+
+
+def test_face_from_edges_rejects_a_self_crossing_boundary():
+    # Regression test: on a real folded scan, some cells end up with
+    # degenerate/self-intersecting boundary curves. OpenCASCADE can
+    # "successfully" fill these (IsDone() True) while producing a
+    # geometrically invalid face -- this showed up as SolidWorks
+    # import diagnostics flagging faces as invalid. face_from_edges
+    # must catch this itself (via BRepCheck_Analyzer) rather than
+    # silently exporting bad geometry.
+    bowtie_edges = [
+        [[0, 0, 0], [1, 1, 0]],
+        [[1, 1, 0], [1, 0, 0]],
+        [[1, 0, 0], [0, 1, 0]],
+        [[0, 1, 0], [0, 0, 0]],
+    ]
+
+    try:
+        face_from_edges(bowtie_edges)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(
+            "expected a RuntimeError for a self-crossing boundary"
+        )
