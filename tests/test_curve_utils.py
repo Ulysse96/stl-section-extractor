@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from curve_utils import (
+    UNIT_TO_MM,
     build_simple_spline_curve,
     find_curve_crossings,
     fit_portion_adaptive,
@@ -10,6 +11,18 @@ from curve_utils import (
     smooth_curve,
     stitch_curve_fragments,
 )
+
+
+# --------------------------------------------------------------
+# UNIT_TO_MM
+# --------------------------------------------------------------
+
+def test_unit_to_mm_defaults_to_identity_for_millimetres():
+    assert UNIT_TO_MM["mm"] == 1.0
+
+
+def test_unit_to_mm_metres_is_the_thousand_factor():
+    assert UNIT_TO_MM["m"] == 1000.0
 
 
 # --------------------------------------------------------------

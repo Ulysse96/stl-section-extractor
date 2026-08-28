@@ -7,6 +7,7 @@ import ezdxf
 import os
 
 from curve_utils import (
+    UNIT_TO_MM,
     resample,
     stitch_curve_fragments,
     smooth_curve,
@@ -46,6 +47,67 @@ STITCH_TOLERANCE_FACTOR = 3.0
 MIN_CURVE_LENGTH_FACTOR = 6.0
 
 
+def ask_unit(parent):
+    """
+    Shows a small modal window asking which length unit the STL
+    file's coordinates are in (mm by default). Returns the
+    chosen unit's key (a key of UNIT_TO_MM), or None if the
+    window was closed/cancelled.
+    """
+
+    result = {"unit": None}
+
+    window = tk.Toplevel(parent)
+    window.title("STL unit")
+    window.grab_set()
+
+    tk.Label(
+        window,
+        text=(
+            "What length unit is this STL file in?\n"
+            "(everything downstream -- widths, tolerances, "
+            "the exported DXF -- works in mm)"
+        ),
+        justify="left",
+        padx=10,
+        pady=10
+    ).pack()
+
+    unit_var = tk.StringVar(value="mm")
+
+    tk.OptionMenu(
+        window,
+        unit_var,
+        *UNIT_TO_MM.keys()
+    ).pack(
+        pady=(0, 10)
+    )
+
+    def on_ok():
+        result["unit"] = unit_var.get()
+        window.destroy()
+
+    def on_cancel():
+        window.destroy()
+
+    button_frame = tk.Frame(window)
+    button_frame.pack(pady=(0, 10))
+
+    tk.Button(
+        button_frame, text="OK", width=10, command=on_ok
+    ).pack(side="left", padx=5)
+
+    tk.Button(
+        button_frame, text="Cancel", width=10, command=on_cancel
+    ).pack(side="left", padx=5)
+
+    window.protocol("WM_DELETE_WINDOW", on_cancel)
+
+    parent.wait_window(window)
+
+    return result["unit"]
+
+
 # ============================================================
 # 1. SELECT STL
 # ============================================================
@@ -63,6 +125,13 @@ stl_path = filedialog.askopenfilename(
 
 if not stl_path:
     raise SystemExit
+
+stl_unit = ask_unit(root)
+
+if stl_unit is None:
+    raise SystemExit
+
+UNIT_TO_MM_FACTOR = UNIT_TO_MM[stl_unit]
 
 
 # ============================================================
@@ -83,6 +152,15 @@ mesh = pv.read(stl_path)
 
 if mesh.n_points == 0:
     raise RuntimeError("The STL is empty.")
+
+if UNIT_TO_MM_FACTOR != 1.0:
+
+    print(
+        f"Converting from {stl_unit} to mm "
+        f"(x{UNIT_TO_MM_FACTOR:g})..."
+    )
+
+    mesh.points = mesh.points * UNIT_TO_MM_FACTOR
 
 print(
     f"Vertices : {mesh.n_points:,}"

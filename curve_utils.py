@@ -11,6 +11,19 @@ import numpy as np
 from scipy.interpolate import splprep, splev
 
 
+# Every distance in section_stl.py -- the loaded mesh, the
+# width/tolerance parameters, the exported DXF -- is in mm.
+# UNIT_TO_MM converts whatever unit a source STL was actually
+# authored in (some photogrammetry/scan tools export in metres,
+# not mm) back to mm right after loading.
+UNIT_TO_MM = {
+    "mm": 1.0,
+    "cm": 10.0,
+    "m": 1000.0,
+    "in": 25.4,
+}
+
+
 def resample(points, n):
 
     if len(points) <= n:
