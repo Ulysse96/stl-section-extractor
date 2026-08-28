@@ -135,12 +135,14 @@ boundary the STEP surface is built from.
 object — a strap adjustment slot on a cap, a vent — isn't scan noise,
 but it does break the "one simple closed boundary" assumption the whole
 surface step relies on: the boundary loop and the surface itself can
-both get dragged into a bad shape right at that hole. The "Exclude from
-surface" field (next to the smoothing tolerance) takes a comma-separated
-list of sections to leave out of the surface reconstruction specifically
-— e.g. `A5, B11` — found by checking the console output (a section with
-an unusually high "Curves detected" count, or lots of "N crossing(s)
-expected, M found" mismatches nearby, is the usual sign) or by looking
-at `boundary_loop.dxf` for where the outline goes wrong. Excluded
+both get dragged into a bad shape right at that hole (or the STEP file
+comes out tiny and SolidWorks/FreeCAD can't open it properly). After
+plane B's section curves are extracted, an "EXCLUDE SECTIONS FROM
+SURFACE" window opens (every curve visible and labelled, e.g. `A5`,
+`B11` — a typed section number means nothing without seeing it first,
+so this is click-based, not a form field): click a curve to leave it
+out of the surface (it dims); click again to re-include it; close the
+window when done (no clicks = every section is used). Excluded
 sections are still exported to DXF as normal; they're just left out of
-`order_boundary_loop`'s input and the surface's guide curves.
+`order_boundary_loop`'s input and the surface's guide curves for that
+run.

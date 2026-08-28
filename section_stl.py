@@ -689,23 +689,16 @@ def ask_all_parameters(with_plane_b):
         )
 
         add_help(
-            "Section(s) to leave out of the reconstructed surface "
-            "(still exported to DXF as usual) -- e.g. a curve "
-            "crossing a real hole/gap in the object (a strap "
-            "adjustment slot, a vent) rather than scan noise, which "
-            "otherwise drags the boundary loop and the surface "
-            "itself into a bad shape right there. Comma-separated, "
-            "e.g. \"A5, B11\". Leave empty to use every section."
-        )
-
-        exclude_sections_var = add_field(
-            "Exclude from surface:", ""
+            "Sections to leave out of the reconstructed surface are "
+            "chosen later, by clicking on them directly once every "
+            "curve is visible (a real hole/gap in the object, e.g. "
+            "a strap adjustment slot, otherwise drags the boundary "
+            "loop and the surface into a bad shape right there)."
         )
 
     else:
 
         surface_smoothing_var = None
-        exclude_sections_var = None
 
     def on_submit():
 
@@ -785,33 +778,9 @@ def ask_all_parameters(with_plane_b):
                         "Surface smoothing tolerance must be > 0."
                     )
 
-                excluded = set()
-
-                raw_text = exclude_sections_var.get().strip()
-
-                if raw_text:
-
-                    for token in raw_text.split(","):
-
-                        token = token.strip().upper()
-
-                        if not token:
-                            continue
-
-                        if token[0] not in ("A", "B") or not token[1:].isdigit():
-                            raise ValueError(
-                                f"'{token}' is not a valid section "
-                                "(expected e.g. 'A5' or 'B11')."
-                            )
-
-                        excluded.add((token[0], int(token[1:])))
-
-                result["exclude_from_surface"] = excluded
-
             else:
 
                 result["surface_smoothing_mm"] = None
-                result["exclude_from_surface"] = set()
 
         except ValueError as exc:
 
@@ -860,7 +829,6 @@ max_polynomial_degree = parameters["max_polynomial_degree"]
 r2_target = parameters["r2_target"]
 reconstruction_method = parameters["reconstruction_method"]
 surface_smoothing_mm = parameters["surface_smoothing_mm"]
-exclude_from_surface = parameters["exclude_from_surface"]
 
 
 print()
@@ -1690,16 +1658,181 @@ boundary_loop_points = (
     else None
 )
 
-# A separate view of the curve set with the user's excluded sections
-# (real holes/gaps in the object -- e.g. a strap adjustment slot --
-# rather than scan noise) left out, used ONLY for surface
-# reconstruction below. The DXF exports above/below (including
-# boundary_loop.dxf) still use the full, unfiltered rich_main_curves,
-# so excluded sections stay visible there for reference/diagnosis.
+# --------------------------------------------------------
+# 12bis. EXCLUDE SECTIONS FROM THE RECONSTRUCTED SURFACE
+#        (optional, click-based)
+# --------------------------------------------------------
+#
+# A real hole/gap in the object (a strap adjustment slot, a vent)
+# isn't scan noise, but it does break the "one simple closed
+# boundary" assumption the surface step relies on -- the boundary
+# loop and the surface itself can both get dragged into a bad shape
+# right at that hole. Which section(s) cross it can only really be
+# told apart by SEEING them (a section number alone means nothing
+# without the picture), so this is a click window, not a typed list.
+# Excluded sections stay in every DXF export as usual (see
+# rich_main_curves/boundary_loop_points above); only this separate
+# surface_main_curves view, used for surface reconstruction below,
+# leaves them out.
+
+excluded_from_surface = set()
+
+if use_plane_b and len(rich_main_curves) >= 3:
+
+    print()
+    print("======================================")
+    print("EXCLUDE SECTIONS FROM SURFACE (optional)")
+    print("======================================")
+
+    print(
+        "Click a curve to exclude it from the reconstructed surface\n"
+        "-- e.g. one crossing a real hole/gap in the object, like a\n"
+        "strap adjustment slot, rather than scan noise. Click again\n"
+        "to re-include it. Excluded curves turn dim/thin; every DXF\n"
+        "export still includes them as usual. Close the window when\n"
+        "done (no clicks = use every section)."
+    )
+
+    exclude_colors = [
+        "red", "blue", "green", "orange", "purple",
+        "cyan", "magenta", "brown"
+    ]
+
+    exclude_plotter = pv.Plotter(
+        window_size=(1500, 950)
+    )
+
+    exclude_plotter.add_mesh(
+        mesh,
+        color="lightgray",
+        opacity=0.12,
+        show_edges=False
+    )
+
+    exclude_plotter.add_text(
+        "EXCLUDE SECTIONS - click a curve to leave it out of the "
+        "surface (optional)",
+        position="upper_left",
+        font_size=16
+    )
+
+    exclude_actor_map = {}
+
+    for curve_index, key in enumerate(sorted(rich_main_curves.keys())):
+
+        points = rich_main_curves[key]
+
+        if len(points) < 2:
+            continue
+
+        color = exclude_colors[curve_index % len(exclude_colors)]
+
+        line = pv.lines_from_points(
+            points,
+            close=False
+        )
+
+        actor = exclude_plotter.add_mesh(
+            line,
+            color=color,
+            line_width=4,
+            name=f"exclude_curve_{key[0]}{key[1]}"
+        )
+
+        exclude_actor_map[actor] = {
+            "key": key,
+            "default_color": color
+        }
+
+        exclude_plotter.add_point_labels(
+            np.array([points[len(points) // 2]]),
+            [f"{key[0]}{key[1]}"],
+            point_size=1,
+            font_size=14,
+            shape=None,
+            name=f"exclude_label_{key[0]}{key[1]}"
+        )
+
+    exclude_picker = vtk.vtkCellPicker()
+    exclude_picker.SetTolerance(0.005)
+    exclude_picker.PickFromListOn()
+
+    for actor in exclude_actor_map:
+        exclude_picker.AddPickList(actor)
+
+    def exclude_click(caller, event):
+
+        x, y = caller.GetEventPosition()
+
+        exclude_picker.Pick(
+            x,
+            y,
+            0,
+            exclude_plotter.renderer
+        )
+
+        actor = exclude_picker.GetActor()
+
+        if actor is None or actor not in exclude_actor_map:
+            return
+
+        info = exclude_actor_map[actor]
+        key = info["key"]
+
+        if key in excluded_from_surface:
+
+            excluded_from_surface.discard(key)
+
+            actor.prop.color = info["default_color"]
+            actor.prop.line_width = 4
+            actor.prop.opacity = 1.0
+
+            print(f"  {key[0]}{key[1]}: re-included")
+
+        else:
+
+            excluded_from_surface.add(key)
+
+            actor.prop.color = "black"
+            actor.prop.line_width = 1
+            actor.prop.opacity = 0.3
+
+            print(f"  {key[0]}{key[1]}: excluded")
+
+        exclude_plotter.render()
+
+    exclude_plotter.iren.add_observer(
+        "LeftButtonPressEvent",
+        exclude_click
+    )
+
+    exclude_plotter.add_axes()
+
+    exclude_plotter.show()
+
+    if excluded_from_surface:
+
+        print(
+            "  Excluded from surface: "
+            + ", ".join(
+                f"{d}{n}" for d, n in sorted(excluded_from_surface)
+            )
+        )
+
+    else:
+
+        print("  No sections excluded.")
+
+
+# A separate view of the curve set with the excluded sections left
+# out, used ONLY for surface reconstruction below. The DXF exports
+# above (including boundary_loop.dxf) still use the full, unfiltered
+# rich_main_curves, so excluded sections stay visible there for
+# reference/diagnosis.
 surface_main_curves = {
     key: points
     for key, points in rich_main_curves.items()
-    if key not in exclude_from_surface
+    if key not in excluded_from_surface
 }
 
 surface_boundary_loop_points = (
@@ -2671,15 +2804,6 @@ if use_plane_b and surface_boundary_loop_points is not None:
     print("======================================")
     print("SURFACE RECONSTRUCTION (STEP EXPORT)")
     print("======================================")
-
-    if exclude_from_surface:
-
-        print(
-            "  Excluded from surface: "
-            + ", ".join(
-                f"{d}{n}" for d, n in sorted(exclude_from_surface)
-            )
-        )
 
     venv_python = os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
