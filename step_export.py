@@ -36,6 +36,8 @@ normal viewing distance), not a change here.
 import pickle
 import sys
 
+import numpy as np
+
 from OCP.gp import gp_Pnt
 from OCP.TColgp import TColgp_Array1OfPnt
 from OCP.GeomAPI import GeomAPI_PointsToBSpline
@@ -43,10 +45,49 @@ from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge, BRepBuilderAPI_Sewing
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib
 from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
+
+
+# Maximum amount a fitted patch's own bounding box may extend beyond
+# its input boundary points' bounding box, as a multiple of that
+# box's diagonal. BRepCheck_Analyzer (used below) only catches
+# topological invalidity such as self-intersection -- a free-form
+# fill can still be "valid" by that measure while shooting off into
+# a long, wild spike far outside the cell it was asked to fill (seen
+# on a real scan, likely from sparse/degenerate input near a fold).
+# This is a plain sanity check on the fitted surface's own extent,
+# not a topology check.
+MAX_BBOX_EXPANSION_FACTOR = 1.5
+
+
+def _face_exceeds_input_bounds(face, edge_point_lists):
+
+    all_points = np.vstack(edge_point_lists)
+
+    input_min = all_points.min(axis=0)
+    input_max = all_points.max(axis=0)
+
+    diagonal = float(np.linalg.norm(input_max - input_min))
+    margin = max(diagonal, 1e-6) * MAX_BBOX_EXPANSION_FACTOR
+
+    box = Bnd_Box()
+    BRepBndLib.Add_s(face, box)
+
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+
+    face_min = np.array([xmin, ymin, zmin])
+    face_max = np.array([xmax, ymax, zmax])
+
+    return bool(
+        np.any(face_min < input_min - margin)
+        or
+        np.any(face_max > input_max + margin)
+    )
 
 
 # How far (mm) the fitted curve is allowed to deviate from the raw
@@ -116,12 +157,15 @@ def face_from_edges(edge_point_lists):
     smoother.
 
     Raises RuntimeError if OpenCASCADE either fails to fill the
-    boundary at all, or produces a geometrically invalid face (e.g.
+    boundary at all, produces a geometrically invalid face (e.g.
     self-intersecting) -- checked directly with BRepCheck_Analyzer
     rather than trusting IsDone() alone, since a "successful" fill
     can still be invalid B-rep on messy/twisted input curves (this
     is what showed up as SolidWorks import diagnostics flagging
-    faces as invalid on a real, folded scan).
+    faces as invalid on a real, folded scan) -- or produces a face
+    that is topologically fine but shoots far outside its own
+    boundary curves (see _face_exceeds_input_bounds), which showed
+    up as a long, wild spike on that same real scan.
     """
 
     filler = BRepOffsetAPI_MakeFilling()
@@ -145,6 +189,14 @@ def face_from_edges(edge_point_lists):
             "surface is geometrically invalid (likely "
             "self-intersecting, probably from a fold/defect in "
             "the scan at this location)."
+        )
+
+    if _face_exceeds_input_bounds(face, edge_point_lists):
+        raise RuntimeError(
+            "OpenCASCADE filled this cell but the resulting "
+            "surface extends far outside its own boundary curves "
+            "(a wild spike), likely from sparse/degenerate input "
+            "near a fold or defect in the scan."
         )
 
     return face

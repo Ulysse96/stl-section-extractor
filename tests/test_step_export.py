@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("OCP")
 
-from step_export import build_step_surfaces, face_from_edges
+from step_export import build_step_surfaces, face_from_edges, _face_exceeds_input_bounds
 
 
 def _lattice_grid():
@@ -97,3 +97,31 @@ def test_face_from_edges_rejects_a_self_crossing_boundary():
         raise AssertionError(
             "expected a RuntimeError for a self-crossing boundary"
         )
+
+
+def test_face_exceeds_input_bounds_flags_a_far_away_face():
+    # Regression test: BRepCheck_Analyzer only catches topological
+    # invalidity (e.g. self-intersection). A free-form fill can
+    # still be "valid" by that measure while shooting off into a
+    # long, wild spike far outside the cell it was asked to fill --
+    # seen on a real scan, likely from sparse/degenerate input near
+    # a fold. face_from_edges must catch that shape-sanity problem
+    # too, via this bounding-box check, not just topology.
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+
+    input_points = [
+        np.array([[0, 0, 0], [1, 0, 0]], dtype=float),
+        np.array([[0, 1, 0], [1, 1, 0]], dtype=float),
+    ]
+
+    near_face = BRepBuilderAPI_MakeFace(
+        gp_Pln(gp_Pnt(0.5, 0.5, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
+    ).Face()
+
+    far_face = BRepBuilderAPI_MakeFace(
+        gp_Pln(gp_Pnt(500, 500, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
+    ).Face()
+
+    assert _face_exceeds_input_bounds(near_face, input_points) is False
+    assert _face_exceeds_input_bounds(far_face, input_points) is True
