@@ -131,34 +131,57 @@ looser tolerance before giving up, and reports which one worked.
 
 **Why a "successful" STEP file can still be unusable**: OpenCASCADE's own
 validity check (`BRepCheck_Analyzer`) only catches *topological* problems
-(e.g. self-intersection) — it does not notice a B-spline surface whose
-control points oscillated far outside the scan's real size (Runge's
-phenomenon), which happened on a real hat scan: the fill "succeeded",
+(e.g. self-intersection) — it does not notice a surface that stays
+"valid" while locally sagging, bulging, or even failing to cover part of
+the scan at all. This happened on a real hat scan: the fill "succeeded",
 but the resulting surface's control points reached tens of thousands of
 mm for an object a few hundred mm across, and SolidWorks couldn't open
 the file properly.
 
-`step_export.py` now also checks the fitted surface's own raw control
-points against `section_spacing_mm` (the real distance between adjacent
-parallel cutting planes) and treats a wildly oversized surface as a
-failure, feeding into the retry-with-looser-tolerance mechanism above. An
-earlier version of this check compared against the whole object's
-overall size instead, which turned out not to work: a real, non-flat
-scan shows comparable *relative* overshoot whether the surface is fine
-or badly blown up, so that version let real blowups through. Checking
-against the local grid spacing instead gave a clean, wide separation
-between a known-good surface and a broken one.
+`step_export.py` now checks the fitted surface *itself* (not its raw
+control points, which can look wild even on a perfectly good surface —
+see below) against `max_section_spacing_mm` (the larger of the two real
+distances between adjacent parallel cutting planes — the data's own
+local resolution): no point actually on the surface may sit more than
+twice that spacing from the nearest real input point, checked **both
+ways** — every surface point must be near some scan data, and every
+scan data point must be near some surface. Missed either direction on a
+real hat fit: a surface whose control points and *overall* bounding box
+looked plausible had nonetheless only actually covered about half the
+scan's real height, folding back onto the part it did cover instead of
+extending to the rest — invisible to a one-way or whole-surface check,
+caught immediately by checking both directions locally.
 
-**Excluding an edge section can itself break the fill**: confirmed
-directly on a real scan — excluding a section at the very edge of the
-grid (e.g. `A1`, the first plane-A section, `A11`/`B11`, the last ones)
-removes the only nearby guide curve holding the surface down right at
-that part of the boundary, and the fill can bulge uncontrollably there
-regardless of tolerance, surface degree, or curve sampling density (all
-tested directly, none fixed it). If the surface keeps failing after
-excluding an outermost section, that's the likely cause — for now, the
-safest option is to keep edge sections in and exclude only interior
-ones where a hole allows it.
+Getting the sample points themselves right took a few tries, in
+increasing order of both reliability and subtlety — recorded in
+`step_export.py`'s own comment above `_surface_deviates_from_data` in
+more detail than belongs here, since it's the kind of lesson worth not
+re-learning by hand next time this needs touching:
+- comparing the surface's whole bounding box to the whole object's size
+  (too coarse — a real, non-flat scan shows similar *relative* overshoot
+  whether the fit is fine or badly broken, so this let real blowups
+  through);
+- sampling the surface on a plain `(u, v)` parameter grid (the
+  parametrization itself becomes untrustworthy on exactly the kind of
+  distorted, badly-behaved fit this check exists to catch, so this
+  disagreed wildly with the real geometry on the worst cases);
+- the surface's real triangulated mesh for one direction, and directly
+  projecting each scan point onto the surface (`GeomAPI_ProjectPointOnSurf`)
+  for the other, which is what's used now.
+
+**A cutting plane can graze past the object instead of through it**:
+confirmed directly on a real scan — the *outermost* section in a
+direction (e.g. `B11`, the last plane-B section) can end up past where
+the object still has a full, simple cross-section, and only clips a
+small, localized feature instead (a seam, a button, a bump) — the mesh
+intersection fragments into several small disconnected pieces there
+rather than one clean loop, and the reconstructed surface can bulge or
+fail unpredictably regardless of tolerance, degree, or exclusions. If a
+section near the end of plane A or B reports several similarly-sized
+"Curves detected" (rather than one clearly dominant curve and a small,
+much shorter secondary one, which is normal), that section is a likely
+culprit — try reducing that plane's width slightly so its outermost
+section lands back inside the object's simple, full-loop region.
 
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed

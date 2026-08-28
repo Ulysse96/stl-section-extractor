@@ -21,7 +21,7 @@ pytest.importorskip("OCP")
 from step_export import (
     build_single_surface,
     build_step_surfaces,
-    _control_points_exceed_local_scale,
+    _surface_deviates_from_data,
 )
 
 # _synthetic_patch's curves are spaced 4 / (5 - 1) = 1.0 apart, both
@@ -72,7 +72,7 @@ def test_build_single_surface_produces_one_valid_face():
 
     face = build_single_surface(
         boundary, interior_curves,
-        smoothing_tolerance_mm=0.3, section_spacing_mm=SECTION_SPACING_MM
+        smoothing_tolerance_mm=0.3, max_section_spacing_mm=SECTION_SPACING_MM
     )
 
     assert face is not None
@@ -95,7 +95,7 @@ def test_build_single_surface_closes_an_open_boundary_loop():
 
     face = build_single_surface(
         open_boundary, interior_curves,
-        smoothing_tolerance_mm=0.3, section_spacing_mm=SECTION_SPACING_MM
+        smoothing_tolerance_mm=0.3, max_section_spacing_mm=SECTION_SPACING_MM
     )
 
     assert face is not None
@@ -108,7 +108,7 @@ def test_build_step_surfaces_writes_a_valid_step_file_with_one_face(tmp_path):
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
-        "section_spacing_mm": SECTION_SPACING_MM,
+        "max_section_spacing_mm": SECTION_SPACING_MM,
     }
 
     output_path = tmp_path / "surface.step"
@@ -159,7 +159,7 @@ def test_build_single_surface_smooths_a_sharp_local_fold():
 
     face = build_single_surface(
         boundary, interior_curves,
-        smoothing_tolerance_mm=0.05, section_spacing_mm=SECTION_SPACING_MM
+        smoothing_tolerance_mm=0.05, max_section_spacing_mm=SECTION_SPACING_MM
     )
 
     from OCP.gp import gp_Pnt
@@ -196,11 +196,11 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
 
     real_build_single_surface = step_export.build_single_surface
 
-    def flaky_build_single_surface(boundary, interior, tolerance, section_spacing_mm):
+    def flaky_build_single_surface(boundary, interior, tolerance, max_section_spacing_mm):
         calls.append(tolerance)
         if len(calls) < 3:
             raise RuntimeError("simulated fill failure")
-        return real_build_single_surface(boundary, interior, tolerance, section_spacing_mm)
+        return real_build_single_surface(boundary, interior, tolerance, max_section_spacing_mm)
 
     monkeypatch.setattr(
         step_export, "build_single_surface", flaky_build_single_surface
@@ -212,7 +212,7 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
-        "section_spacing_mm": SECTION_SPACING_MM,
+        "max_section_spacing_mm": SECTION_SPACING_MM,
     }
 
     output_path = tmp_path / "surface.step"
@@ -248,7 +248,7 @@ def _make_bezier_face(corners):
     return BRepBuilderAPI_MakeFace(surface, 1e-6).Face()
 
 
-def test_control_points_exceed_local_scale_accepts_a_surface_near_its_input():
+def test_surface_deviates_from_data_accepts_a_surface_near_its_input():
     input_points = np.array(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
     )
@@ -257,19 +257,19 @@ def test_control_points_exceed_local_scale_accepts_a_surface_near_its_input():
         [[[0, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0]]]
     )
 
-    assert not _control_points_exceed_local_scale(
-        near_face, input_points, [input_points], section_spacing_mm=1.0
+    assert not _surface_deviates_from_data(
+        near_face, input_points, [input_points], max_section_spacing_mm=1.0
     )
 
 
-def test_control_points_exceed_local_scale_rejects_a_surface_far_from_its_input():
+def test_surface_deviates_from_data_rejects_a_surface_far_from_its_input():
     # Regression test for the real failure this project hit: a
-    # topologically valid surface whose raw control points blew up
-    # far beyond the scan's local grid spacing (see step_export.py's
-    # module-level comment on _control_points_exceed_local_scale /
-    # MAX_POLE_DEVIATION_FACTOR). Stands in for that blowup with a
-    # face whose control points are deliberately placed tens of
-    # thousands of units away from tiny input curves.
+    # topologically valid surface that locally strayed far from the
+    # actual scan data (see step_export.py's module-level comment on
+    # _surface_deviates_from_data / MAX_SURFACE_DEVIATION_FACTOR).
+    # Stands in for that with a face deliberately placed tens of
+    # thousands of units away from tiny input curves -- every point
+    # actually ON this face is nowhere near any real input point.
     input_points = np.array(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
     )
@@ -279,15 +279,41 @@ def test_control_points_exceed_local_scale_rejects_a_surface_far_from_its_input(
          [[20001, 20000, 0], [20001, 20001, 0]]]
     )
 
-    assert _control_points_exceed_local_scale(
-        far_face, input_points, [input_points], section_spacing_mm=1.0
+    assert _surface_deviates_from_data(
+        far_face, input_points, [input_points], max_section_spacing_mm=1.0
+    )
+
+
+def test_surface_deviates_from_data_rejects_a_surface_missing_real_coverage():
+    # Regression test for the OTHER real failure this project hit,
+    # distinct from a local bulge/sag: a topologically valid surface
+    # that simply didn't extend far enough to cover part of the real
+    # scan data at all -- confirmed directly on a real hat fit whose
+    # real (trimmed) surface only spanned about half the scan's own Z
+    # range. Every point that DID exist on that surface was close to
+    # SOME data point, so a one-way "surface -> data" check missed it
+    # completely; only checking "every data point has nearby surface"
+    # catches a real gap like this. Stands in for that here with a
+    # small face that legitimately covers three of four input points,
+    # but leaves one far corner with no nearby surface at all.
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [10, 10, 0]],
+        dtype=float,
+    )
+
+    small_face = _make_bezier_face(
+        [[[0, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0]]]
+    )
+
+    assert _surface_deviates_from_data(
+        small_face, input_points, [input_points], max_section_spacing_mm=1.0
     )
 
 
 def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
     import step_export
 
-    def always_fails(boundary, interior, tolerance, section_spacing_mm):
+    def always_fails(boundary, interior, tolerance, max_section_spacing_mm):
         raise RuntimeError("simulated fill failure")
 
     monkeypatch.setattr(step_export, "build_single_surface", always_fails)
@@ -298,7 +324,7 @@ def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
-        "section_spacing_mm": SECTION_SPACING_MM,
+        "max_section_spacing_mm": SECTION_SPACING_MM,
     }
 
     try:

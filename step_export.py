@@ -43,43 +43,86 @@ import numpy as np
 
 from OCP.gp import gp_Pnt
 from OCP.TColgp import TColgp_Array1OfPnt
-from OCP.GeomAPI import GeomAPI_PointsToBSpline
+from OCP.GeomAPI import GeomAPI_PointsToBSpline, GeomAPI_ProjectPointOnSurf
 from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRep import BRep_Tool
+from OCP.BRepMesh import BRepMesh_IncrementalMesh
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
 
 
-# How far a fitted surface's raw B-spline control points may sit
-# beyond the input curves' own bounding box, as a multiple of
-# section_spacing_mm (the real distance between adjacent parallel
-# cutting planes -- the data's natural local length scale).
-# BRepCheck_Analyzer only catches topological invalidity (e.g.
-# self-intersection); it does NOT catch a degree-8 B-spline surface
-# whose control points oscillated (Runge's phenomenon) into
-# thousands of mm for a scan whose real extent is a few hundred.
+# How far ANY point actually ON the fitted surface may sit from the
+# nearest real input point (boundary or guide curve), as a multiple
+# of max_section_spacing_mm (the LARGER of the two distances between
+# adjacent parallel cutting planes -- the data's own natural local
+# resolution) -- checked BOTH ways (surface point -> nearest data
+# point, and data point -> nearest surface point), so a real gap
+# where the fit simply failed to cover part of the patch is caught
+# too, not just a local bulge. BRepCheck_Analyzer only catches
+# topological invalidity (e.g. self-intersection); it does not catch
+# a surface that stays "valid" while sagging, bulging, or leaving a
+# hole, far past where its own guide curves actually are.
 #
-# An earlier version of this check compared the surface's own
-# (trimmed, AddOptimal_s) bounding box to a multiple of the WHOLE
-# object's diagonal instead. That could not actually tell a good
-# surface from a bad one: a real, non-flat scan (a hat, not a flat
-# test plate) shows comparable *relative* overshoot in both cases.
-# Measured directly against this project's own known-good synthetic
-# test surface and a real, broken hat export: the good surface's raw
-# control points overshoot the input bounding box by up to ~160x the
-# local grid spacing; the broken hat overshoots by 1150-2190x -- a
-# clean, wide gap the diagonal-relative check could not see, because
-# on that metric both cases looked similar.
-MAX_POLE_DEVIATION_FACTOR = 300
+# Getting the actual sample points right took three attempts:
+#
+# 1. Comparing the surface's own TRIMMED bounding box (BRepBndLib.
+#    AddOptimal_s) to a multiple of the whole object's diagonal, and
+#    later to a multiple of the local grid spacing. Both are a single
+#    GLOBAL number for the whole surface, and missed a real, confirmed
+#    failure -- a fitted surface whose control points and overall
+#    bbox looked plausible in aggregate, but which locally sagged/left
+#    a gap that a global check averages away.
+# 2. Sampling the surface directly on a (u, v) grid across its own
+#    parameter domain, keeping only points BRepTopAdaptor_FClass2d
+#    classified as inside the trim. Fixed the "global" problem, but
+#    turned out to be unreliable on exactly the kind of badly-behaved
+#    surface this check exists to catch: confirmed directly against a
+#    real fit whose extreme, distorted parametrization made this
+#    sampling disagree wildly with the actual trimmed geometry
+#    (AddOptimal_s said the real surface only spanned Z -66.7 to
+#    -8.5mm on that same face; UV-grid sampling said -106 to +110mm).
+#    With a pathological fit, the parametrization itself can't be
+#    trusted to say what is or isn't "inside" the face.
+# 3. What the "surface -> data" direction uses now: BRepMesh_
+#    IncrementalMesh's own triangulation of the face, read back via
+#    BRep_Tool.Triangulation_s (with isRelative=True -- an absolute
+#    deflection made Triangulation_s silently come back None below,
+#    IsDone() still True, at every value tried from 0.001 to 1.0;
+#    confirmed a size-relative deflection fixes it). This is the same
+#    tessellation any real STEP consumer (a viewer, or Wrapstyler)
+#    effectively builds to work with the face at all, and sidesteps
+#    parametrization entirely -- it only sees triangles that end up
+#    covering the real, trimmed 3D shape.
+#
+#    The reverse "data -> surface" direction can't reuse those same
+#    mesh samples, though: pushing the mesh fine enough to avoid gaps
+#    between vertices reading as false "uncovered" data points isn't
+#    reliable in this environment (mirrors point 2's lesson: sampling
+#    density becomes the thing under test instead of the surface).
+#    Confirmed directly -- even a good, correct fit showed an apparent
+#    2.05mm gap against a 2.0mm threshold from mesh sparseness alone.
+#    That direction instead projects each data point onto the surface
+#    with GeomAPI_ProjectPointOnSurf (the same approach already used
+#    by the "smooths a sharp fold" test below) for the TRUE nearest
+#    point on the continuous surface, independent of mesh density.
+#
+# Deliberately avoids scipy (not just numpy) for the "surface -> data"
+# nearest-neighbour search: this project's .venv312 has hit Windows
+# Smart App Control blocking scipy's compiled extensions before (see
+# README), so this stays plain numpy, chunked to bound memory use.
+MAX_SURFACE_DEVIATION_FACTOR = 2.0
+MESH_LINEAR_DEFLECTION_FACTOR = 0.25
+_NEAREST_NEIGHBOUR_CHUNK = 200
 
 
-def _control_points_exceed_local_scale(
-    face, boundary_points, interior_curves, section_spacing_mm
+def _surface_deviates_from_data(
+    face, boundary_points, interior_curves, max_section_spacing_mm
 ):
 
     all_points = [np.asarray(boundary_points, dtype=float)]
@@ -91,33 +134,93 @@ def _control_points_exceed_local_scale(
         if len(points) >= 1:
             all_points.append(points)
 
-    stacked = np.vstack(all_points)
+    data_points = np.vstack(all_points)
 
-    input_min = stacked.min(axis=0)
-    input_max = stacked.max(axis=0)
+    deflection = max(
+        max_section_spacing_mm * MESH_LINEAR_DEFLECTION_FACTOR, 1e-3
+    )
 
-    # BRepOffsetAPI_MakeFilling always produces a Geom_BSplineSurface,
-    # so Pole()/NbUPoles()/NbVPoles() are always available here.
-    surface = BRep_Tool.Surface_s(face)
+    # isRelative=True matters here -- an absolute deflection made
+    # Triangulation_s silently come back None below (IsDone() still
+    # True) on this project's own synthetic test surface, at every
+    # deflection value tried from 0.001 up to 1.0. Confirmed directly
+    # that switching to a size-relative deflection fixed it, with no
+    # other change.
+    BRepMesh_IncrementalMesh(face, deflection, True, 0.5, True)
 
-    poles = np.array([
+    location = TopLoc_Location()
+    triangulation = BRep_Tool.Triangulation_s(face, location)
+
+    if triangulation is None:
+        return True
+
+    transform = location.Transformation()
+
+    samples = np.array([
         [
-            surface.Pole(i, j).X(),
-            surface.Pole(i, j).Y(),
-            surface.Pole(i, j).Z(),
+            node.X(), node.Y(), node.Z()
         ]
-        for i in range(1, surface.NbUPoles() + 1)
-        for j in range(1, surface.NbVPoles() + 1)
+        for node in (
+            triangulation.Node(i).Transformed(transform)
+            for i in range(1, triangulation.NbNodes() + 1)
+        )
     ])
 
-    pole_min = poles.min(axis=0)
-    pole_max = poles.max(axis=0)
+    if len(samples) == 0:
+        return True
 
-    threshold = max(section_spacing_mm, 1e-6) * MAX_POLE_DEVIATION_FACTOR
+    threshold = (
+        max(max_section_spacing_mm, 1e-6) * MAX_SURFACE_DEVIATION_FACTOR
+    )
 
-    overshoot = np.maximum(input_min - pole_min, pole_max - input_max)
+    worst_surface_to_data = 0.0
 
-    return bool(np.any(overshoot > threshold))
+    for start in range(0, len(samples), _NEAREST_NEIGHBOUR_CHUNK):
+
+        batch = samples[start:start + _NEAREST_NEIGHBOUR_CHUNK]
+
+        distances = np.linalg.norm(
+            batch[:, None, :] - data_points[None, :, :], axis=2
+        )
+
+        worst_surface_to_data = max(
+            worst_surface_to_data, distances.min(axis=1).max()
+        )
+
+    if worst_surface_to_data > threshold:
+        return True
+
+    # The reverse direction (does every real data point have nearby
+    # surface, not just "every bit of surface that exists is near
+    # data") can't reuse the same mesh samples: BRepMesh_IncrementalMesh
+    # would need to be pushed to an unreliably fine deflection to
+    # avoid gaps between mesh vertices reading as false "no nearby
+    # surface" positives (confirmed directly: even a good, correct fit
+    # showed an apparent 2.05mm gap here against a 2.0mm threshold,
+    # from mesh sparseness alone, not a real defect). Projecting each
+    # data point onto the surface directly (GeomAPI_ProjectPointOnSurf,
+    # the same approach the "smooths a sharp fold" test already uses)
+    # gives the TRUE nearest point on the continuous surface, so
+    # coverage isn't limited by how fine a mesh OCCT happens to build.
+    surface = BRep_Tool.Surface_s(face)
+
+    for point in data_points:
+
+        target = gp_Pnt(float(point[0]), float(point[1]), float(point[2]))
+
+        projector = GeomAPI_ProjectPointOnSurf(target, surface)
+
+        if projector.NbPoints() == 0:
+            return True
+
+        nearest = projector.NearestPoint()
+
+        distance = target.Distance(nearest)
+
+        if distance > threshold:
+            return True
+
+    return False
 
 
 # Default "how much may the surface deviate from the raw curve
@@ -165,7 +268,8 @@ def edge_from_points(points, tolerance_mm):
 
 
 def build_single_surface(
-    boundary_points, interior_curves, smoothing_tolerance_mm, section_spacing_mm
+    boundary_points, interior_curves, smoothing_tolerance_mm,
+    max_section_spacing_mm
 ):
     """
     Builds ONE TopoDS_Face covering the whole scanned patch: the
@@ -177,19 +281,19 @@ def build_single_surface(
     combination (one free-form fill, boundary + internal guides)
     was chosen over a per-cell patchwork.
 
-    `section_spacing_mm` is the real distance between adjacent
-    parallel cutting planes (section_stl.py's width_a/(count_a-1) or
-    width_b/(count_b-1)) -- the data's natural local length scale,
-    used by the control-point sanity check below.
+    `max_section_spacing_mm` is the LARGER of the two real distances
+    between adjacent parallel cutting planes (section_stl.py's
+    width_a/(count_a-1) and width_b/(count_b-1)) -- the data's
+    natural local length scale, used by the surface-deviation sanity
+    check below.
 
     Raises RuntimeError if OpenCASCADE fails to build the surface,
     builds one that is not a topologically valid B-rep face (checked
     with BRepCheck_Analyzer rather than trusting the algorithm's own
     "done" status alone), or builds a topologically "valid" surface
-    whose control points blew up far beyond the input curves' own
-    extent (see _control_points_exceed_local_scale) -- a real
-    failure mode on a genuinely complex shape, not just a
-    hypothetical one.
+    that locally sags/bulges far past where the real input data
+    actually is (see _surface_deviates_from_data) -- a real failure
+    mode on a genuinely complex shape, not just a hypothetical one.
     """
 
     filler = BRepOffsetAPI_MakeFilling(
@@ -254,15 +358,15 @@ def build_single_surface(
             "invalid (likely self-intersecting)."
         )
 
-    if _control_points_exceed_local_scale(
-        face, boundary_points, interior_curves, section_spacing_mm
+    if _surface_deviates_from_data(
+        face, boundary_points, interior_curves, max_section_spacing_mm
     ):
         raise RuntimeError(
-            "OpenCASCADE built a topologically valid surface, but "
-            "its control points blew up far beyond the scan's local "
-            "grid spacing (a B-spline surface can oscillate wildly "
-            "-- Runge's phenomenon -- when the shape is too complex "
-            "for its degree at this tolerance)."
+            "OpenCASCADE built a topologically valid surface, but it "
+            "locally sags or bulges far beyond the scan's local grid "
+            "spacing at some point on the surface (a B-spline surface "
+            "can oscillate wildly -- Runge's phenomenon -- when the "
+            "shape is too complex for its degree at this tolerance)."
         )
 
     return face
@@ -315,8 +419,8 @@ def build_step_surfaces(data, output_path):
     """
     Entry point: takes the dict pickled by section_stl.py
     ({"boundary_loop": ..., "interior_curves": ...,
-    "smoothing_tolerance_mm": ..., "section_spacing_mm": ...}) and
-    writes the single reconstructed surface to `output_path`.
+    "smoothing_tolerance_mm": ..., "max_section_spacing_mm": ...})
+    and writes the single reconstructed surface to `output_path`.
 
     If the fill fails at the requested smoothing tolerance, retries
     a few times with a progressively looser one (see
@@ -337,7 +441,7 @@ def build_step_surfaces(data, output_path):
                 data["boundary_loop"],
                 data["interior_curves"],
                 tolerance,
-                data["section_spacing_mm"]
+                data["max_section_spacing_mm"]
             )
 
             if attempt > 0:

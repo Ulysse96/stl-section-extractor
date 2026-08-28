@@ -2879,13 +2879,12 @@ if use_plane_b and surface_boundary_loop_points is not None:
 
     else:
 
-        # The real distance between adjacent parallel cutting planes --
-        # the data's natural local length scale, used by step_export.py
-        # to sanity-check the fitted surface's control points (a
-        # global "whole object size" scale can't tell a good fit from
-        # a Runge's-phenomenon blowup on a non-flat scan; see
-        # step_export.py's module docstring).
-        section_spacing_mm = min(
+        # The LARGER of the two real distances between adjacent
+        # parallel cutting planes -- the data's natural local length
+        # scale, used by step_export.py to sanity-check how far the
+        # fitted surface strays from the real input data at any one
+        # point (see step_export.py's module docstring).
+        max_section_spacing_mm = max(
             width_a / max(number_of_sections_a - 1, 1),
             width_b / max(number_of_sections_b - 1, 1)
         )
@@ -2894,7 +2893,7 @@ if use_plane_b and surface_boundary_loop_points is not None:
             "boundary_loop": surface_boundary_loop_points,
             "interior_curves": list(surface_main_curves.values()),
             "smoothing_tolerance_mm": surface_smoothing_mm,
-            "section_spacing_mm": section_spacing_mm
+            "max_section_spacing_mm": max_section_spacing_mm
         }
 
         data_pickle_path = os.path.join(
