@@ -473,6 +473,48 @@ def test_build_surface_grid_boundary_edges_reach_the_curve_endpoints():
     np.testing.assert_allclose(end, [[3, 1, 0], [4, 1, 0]])
 
 
+def test_build_surface_grid_handles_two_crossings_at_the_same_curve_index():
+    # Regression test: on a real (noisy/self-crossing) scan, two
+    # different crossings from the other family can land on the
+    # exact same nearest point index of a curve. build_surface_grid
+    # must not crash (it used to: IndexError in the snapping loop,
+    # since segment_curve_at_indices silently de-duplicates that
+    # index into a single boundary while the un-deduplicated hit
+    # list still expected one more segment than actually existed).
+    all_section_data, found_intersections = _make_lattice_grid_inputs()
+
+    # A_2 x B_1 and A_2 x B_3 both snapped to the same point (index 2
+    # along A_2, i.e. x=2) instead of their own distinct x=1 / x=3.
+    for entry in found_intersections:
+        i, j, k = entry["pair_id"]
+        if i == 2 and j in (1, 3):
+            entry["idx_a"] = 2
+            entry["point"] = np.array([2, 2, 0], dtype=float)
+
+    grid = build_surface_grid(all_section_data, found_intersections)
+
+    # Must not raise, and must still produce a usable (if reduced)
+    # grid rather than silently corrupting data.
+    assert isinstance(grid["cells"], list)
+
+
+def test_build_surface_grid_handles_a_crossing_at_the_curve_endpoint():
+    # Regression test for the same crash, other trigger: a crossing
+    # landing exactly on the curve's own open endpoint (index 0 or
+    # n - 1), which segment_curve_at_indices treats as "already a
+    # boundary" rather than a new interior split.
+    all_section_data, found_intersections = _make_lattice_grid_inputs()
+
+    for entry in found_intersections:
+        i, j, k = entry["pair_id"]
+        if i == 1 and j == 1:
+            entry["idx_a"] = 0  # A_1's own start point, x=0
+
+    grid = build_surface_grid(all_section_data, found_intersections)
+
+    assert isinstance(grid["cells"], list)
+
+
 def test_collect_curve_endpoints_gathers_both_ends_of_every_curve():
     all_section_data, found_intersections = _make_lattice_grid_inputs()
 

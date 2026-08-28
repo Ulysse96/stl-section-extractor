@@ -925,13 +925,42 @@ def build_surface_grid(all_section_data, found_intersections):
 
         hits.sort(key=lambda h: h[0])
 
-        cut_indices = [idx for idx, _, _ in hits]
+        n_points = len(points)
+
+        # On a complex/self-crossing scan, two different crossings
+        # from the other family can legitimately snap to the exact
+        # same nearest point on this curve (or, more rarely, to
+        # this curve's own open endpoint). segment_curve_at_indices
+        # only ever creates one boundary per distinct INTERIOR
+        # index, so this curve's hits are filtered down to match --
+        # keeping the first hit seen at each index -- before being
+        # used to index into its segments. Hits dropped here are
+        # not lost network-wide: the other curve of that pair still
+        # carries the crossing.
+        filtered_hits = []
+        seen_indices = set()
+
+        for idx, other_number, point in hits:
+
+            if idx in seen_indices:
+                continue
+
+            if not (0 < idx < n_points - 1):
+                continue
+
+            seen_indices.add(idx)
+            filtered_hits.append((idx, other_number, point))
+
+        if not filtered_hits:
+            continue
+
+        cut_indices = [idx for idx, _, _ in filtered_hits]
 
         segments = segment_curve_at_indices(points, cut_indices)
 
         segments = [seg.copy() for seg in segments]
 
-        for m, (_, _, snapped_point) in enumerate(hits):
+        for m, (_, _, snapped_point) in enumerate(filtered_hits):
 
             segments[m][-1] = snapped_point
             segments[m + 1][0] = snapped_point
@@ -941,10 +970,10 @@ def build_surface_grid(all_section_data, found_intersections):
 
         edges = {}
 
-        for m in range(len(hits) - 1):
+        for m in range(len(filtered_hits) - 1):
 
-            lo = hits[m][1]
-            hi = hits[m + 1][1]
+            lo = filtered_hits[m][1]
+            hi = filtered_hits[m + 1][1]
 
             edges[(min(lo, hi), max(lo, hi))] = segments[m + 1]
 
