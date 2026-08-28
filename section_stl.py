@@ -2178,6 +2178,26 @@ os.makedirs(main_dir, exist_ok=True)
 os.makedirs(dir3d, exist_ok=True)
 
 
+def new_dxf_document():
+    """
+    ezdxf.new() defaults a fresh document's $INSUNITS header to
+    METRES, not millimetres -- every coordinate this script writes
+    is in mm (see UNIT_TO_MM / ask_unit() above), so leaving that
+    default in place tags every exported file as being in metres
+    while it actually contains mm-scale numbers. A CAD import that
+    trusts the DXF's declared unit (e.g. importing into a SolidWorks
+    document whose own units are set to meters) then silently
+    inflates every dimension by 1000x on import. Setting mm here
+    explicitly is what actually fixes that -- independently of
+    whatever unit the source STL itself was in.
+    """
+
+    doc = ezdxf.new("R2010")
+    doc.units = ezdxf.units.MM
+
+    return doc
+
+
 def make_spline_points(points_2d_or_3d, is_3d=False):
     """Resample a curve and return a list of ezdxf-ready 3-tuples."""
 
@@ -2272,7 +2292,7 @@ for data in all_section_data:
         filename
     )
 
-    doc = ezdxf.new("R2010")
+    doc = new_dxf_document()
     msp = doc.modelspace()
 
     for curve_info in data["curves"]:
@@ -2313,7 +2333,7 @@ for data in all_section_data:
         filename
     )
 
-    doc = ezdxf.new("R2010")
+    doc = new_dxf_document()
     msp = doc.modelspace()
 
     key = (data["direction"], data["number"])
@@ -2357,7 +2377,7 @@ dxf_path_3d = os.path.join(
     "sections_main_3d.dxf"
 )
 
-doc3d = ezdxf.new("R2010")
+doc3d = new_dxf_document()
 msp3d = doc3d.modelspace()
 
 for data in all_section_data:
@@ -2399,7 +2419,7 @@ if use_plane_b and found_intersections:
         "intersections_reference.dxf"
     )
 
-    doc_int = ezdxf.new("R2010")
+    doc_int = new_dxf_document()
     msp_int = doc_int.modelspace()
 
     for entry in found_intersections:
