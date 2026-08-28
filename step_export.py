@@ -143,7 +143,25 @@ def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_m
         edge = edge_from_points(curve_points, smoothing_tolerance_mm)
         filler.Add(edge, GeomAbs_C0, False)
 
-    filler.Build()
+    # On a genuinely inconsistent boundary, OpenCASCADE doesn't
+    # always fail softly via IsDone() -- it can raise its own native
+    # exception straight out of Build(). curve_utils.order_boundary_loop
+    # guarantees a non-self-crossing loop (via a nearest-neighbour
+    # walk + 2-opt uncrossing pass) so this shouldn't trigger from a
+    # bad boundary anymore, but it's still caught here and turned
+    # into a normal RuntimeError so the caller (and section_stl.py,
+    # which runs this as a subprocess) gets a clear message instead
+    # of a raw OCP traceback either way.
+    try:
+        filler.Build()
+    except Exception as exc:
+        raise RuntimeError(
+            "OpenCASCADE could not fill the boundary loop and guide "
+            f"curves into a single surface ({exc}). This usually "
+            "means the boundary loop crosses itself -- check "
+            "sections_3d/boundary_loop.dxf for a clean, simple "
+            "outline with no self-crossings."
+        ) from exc
 
     if not filler.IsDone():
         raise RuntimeError(

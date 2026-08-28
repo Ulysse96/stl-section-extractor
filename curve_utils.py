@@ -745,19 +745,89 @@ def build_simple_spline_curve(curve_3d, intersection_points):
     return np.asarray(result, dtype=float)
 
 
+def _segments_intersect_2d(a, b, c, d):
+    """True if open segments a-b and c-d cross, in 2D."""
+
+    def turn(p, q, r):
+        return (r[1] - p[1]) * (q[0] - p[0]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    d1 = turn(c, d, a)
+    d2 = turn(c, d, b)
+    d3 = turn(a, b, c)
+    d4 = turn(a, b, d)
+
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _uncross_loop_2opt(proj_2d, order):
+    """
+    Standard 2-opt uncrossing: while any two non-adjacent edges of
+    the closed tour `order` cross (in the 2D projection), reverse
+    the segment between them -- this always strictly shortens the
+    tour, so it is guaranteed to terminate, and it terminates at a
+    simple (non-self-intersecting) polygon.
+    """
+
+    order = list(order)
+    n = len(order)
+
+    improved = True
+
+    while improved:
+
+        improved = False
+
+        for i in range(n):
+
+            a = proj_2d[order[i]]
+            b = proj_2d[order[(i + 1) % n]]
+
+            for j in range(i + 2, n):
+
+                if i == 0 and j == n - 1:
+                    continue  # these two edges are adjacent (wrap-around)
+
+                c = proj_2d[order[j]]
+                d = proj_2d[order[(j + 1) % n]]
+
+                if _segments_intersect_2d(a, b, c, d):
+
+                    order[i + 1:j + 1] = order[i + 1:j + 1][::-1]
+                    improved = True
+                    break
+
+            if improved:
+                break
+
+    return order
+
+
 def order_boundary_loop(points):
     """
     Orders an unordered set of 3D points that lie roughly on the
-    boundary of a disk-like patch (no holes) into a single closed
-    loop, by projecting them onto the patch's own best-fit plane
-    (via PCA) and sorting by angle around their centroid.
+    boundary of a disk-like patch (no holes) into a single closed,
+    non-self-intersecting loop: an initial greedy nearest-neighbour
+    chain (starting from an arbitrary point, repeatedly jumping to
+    whichever remaining point is closest, projected onto the patch's
+    own best-fit plane via PCA), then a standard 2-opt uncrossing
+    pass that removes any remaining self-crossings.
 
     Used to turn the collection of open endpoints of every A/B
     section curve -- which sit on the true edge of the scanned
-    surface -- into one ordered boundary loop. Assumes the
-    patch's boundary is star-shaped around its centroid once
-    projected (true for a cap/hat-like scan); not guaranteed for
-    an arbitrary/concave outline.
+    surface -- into one ordered boundary loop.
+
+    Two earlier versions of this function were tried and found too
+    fragile on a real, non-convex scan outline (a hat with an uneven
+    brim), both letting OpenCASCADE's surface filler receive a
+    self-crossing "boundary" (which either built an invalid face or
+    raised a construction error outright): sorting by angle around
+    the centroid assumes the boundary is star-shaped around it, and
+    plain nearest-neighbour chaining (no 2-opt) can "jump the gap"
+    across a concave notch when two points on either side of it
+    happen to be mutually nearest at some step -- confirmed directly
+    with a synthetic U-shaped test case. The 2-opt pass here fixes
+    exactly that: it is guaranteed to terminate (every swap strictly
+    shortens the tour) at a genuinely simple polygon.
 
     Returns the same points, reordered so consecutive rows are
     consecutive around the loop (nothing is added, removed, or
@@ -766,24 +836,37 @@ def order_boundary_loop(points):
 
     pts = np.asarray(points, dtype=float)
 
+    n = len(pts)
+
     centroid = pts.mean(axis=0)
 
     centered = pts - centroid
 
     # PCA via SVD: the two directions of largest spread define the
-    # patch's own 2D plane basis; the third (discarded) singular
-    # direction is the patch's normal.
+    # patch's own 2D plane basis, used only to detect crossings (a
+    # 2D-projection concept) below -- the returned points stay 3D.
     _, _, vh = np.linalg.svd(centered, full_matrices=False)
 
-    basis_u = vh[0]
-    basis_v = vh[1]
+    proj_2d = np.column_stack(
+        [centered @ vh[0], centered @ vh[1]]
+    )
 
-    u = centered @ basis_u
-    v = centered @ basis_v
+    remaining = list(range(1, n))
+    order = [0]
 
-    angles = np.arctan2(v, u)
+    while remaining:
 
-    order = np.argsort(angles)
+        current = proj_2d[order[-1]]
+
+        candidates = proj_2d[remaining]
+
+        dists = np.linalg.norm(candidates - current, axis=1)
+
+        nearest_pos = int(np.argmin(dists))
+
+        order.append(remaining.pop(nearest_pos))
+
+    order = _uncross_loop_2opt(proj_2d, order)
 
     return pts[order]
 

@@ -3,6 +3,7 @@ import pytest
 
 from curve_utils import (
     UNIT_TO_MM,
+    _segments_intersect_2d,
     build_simple_spline_curve,
     collect_curve_endpoints,
     find_curve_crossings,
@@ -320,6 +321,60 @@ def test_order_boundary_loop_works_regardless_of_the_patch_orientation():
         np.roll(ordered, -1, axis=0) - ordered, axis=1
     )
     assert np.max(edge_lengths) == pytest.approx(np.min(edge_lengths), rel=0.3)
+
+
+def _has_self_intersection(ordered_points_2d):
+    n = len(ordered_points_2d)
+
+    for i in range(n):
+
+        a, b = ordered_points_2d[i], ordered_points_2d[(i + 1) % n]
+
+        for j in range(i + 2, n):
+
+            if i == 0 and j == n - 1:
+                continue  # adjacent (wrap-around) edges never "cross"
+
+            c, d = ordered_points_2d[j], ordered_points_2d[(j + 1) % n]
+
+            if _segments_intersect_2d(a, b, c, d):
+                return True
+
+    return False
+
+
+def test_order_boundary_loop_handles_a_non_convex_outline():
+    # A "U"/staple-shaped outline, whose centroid sits in the
+    # concave notch -- exactly the case that broke this function's
+    # earlier implementations on a real, non-convex scan (a hat with
+    # an uneven brim): points on the two "prongs" of the U can have
+    # similar angles from a centroid outside the shape (angle-sort),
+    # or the notch's two inner corners can be mutually nearest at
+    # some step and get connected straight across it (plain
+    # nearest-neighbour, no uncrossing pass). The property that
+    # actually matters -- and the one OpenCASCADE's filler needs --
+    # isn't reproducing one specific "intended" polygon (several
+    # valid simple ones can exist through the same point set), it's
+    # that the result has NO self-crossing edges at all.
+    # Slightly perturbed off a perfect grid (real scan boundary
+    # points are never exactly collinear/on-grid) so no three points
+    # are ever exactly collinear -- that degenerate case makes
+    # "does this edge cross that edge" genuinely ambiguous at the
+    # touching point, which isn't what this test is about.
+    true_perimeter = np.array(
+        [
+            [0, 0, 0], [0.05, 3, 0], [1, 2.95, 0], [1, 1, 0],
+            [2, 1.05, 0], [1.95, 3, 0], [3, 3.05, 0], [3, 0, 0],
+        ],
+        dtype=float,
+    )
+
+    scrambled_order = [5, 1, 7, 3, 0, 6, 2, 4]
+    ordered = order_boundary_loop(true_perimeter[scrambled_order])
+
+    # The loop is already planar (all z=0) -- use x, y directly as
+    # the 2D projection for the crossing check.
+    assert not _has_self_intersection(ordered[:, :2])
 
 
 # --------------------------------------------------------------
