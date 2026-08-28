@@ -5,6 +5,8 @@ import pyvista as pv
 import vtk
 import ezdxf
 import os
+import pickle
+import subprocess
 
 from curve_utils import (
     UNIT_TO_MM,
@@ -15,6 +17,7 @@ from curve_utils import (
     reconstruct_curve_piecewise,
     find_curve_crossings,
     build_simple_spline_curve,
+    build_surface_grid,
 )
 
 
@@ -1601,7 +1604,12 @@ def find_all_intersections(all_section_data, plane_intersections):
     many distinct closest-approach locations between the CURRENT
     curve A_i and curve B_j (whatever state they are in when this
     is called). Returns a list of
-    {"pair_id": (i, j, k), "point": ..., "gap": ...}.
+    {"pair_id": (i, j, k), "point": ..., "gap": ...,
+    "idx_a": ..., "idx_b": ...} where idx_a/idx_b are the point
+    indices, along curve A_i's and B_j's own points_3d array,
+    where the crossing sits -- used downstream to cut each curve
+    into segments at its crossings for surface reconstruction
+    (see curve_utils.segment_curve_at_indices).
     Does not modify any curve.
     """
 
@@ -1671,7 +1679,9 @@ def find_all_intersections(all_section_data, plane_intersections):
                 {
                     "pair_id": (i, j, k),
                     "point": reference_point,
-                    "gap": gap
+                    "gap": gap,
+                    "idx_a": int(idx_a),
+                    "idx_b": int(idx_b)
                 }
             )
 
@@ -2445,7 +2455,118 @@ if use_plane_b and found_intersections:
 
 
 # ============================================================
-# 14. DONE
+# 14. SURFACE RECONSTRUCTION (STEP EXPORT)
+# ============================================================
+#
+# Builds one smooth surface patch per interior cell of the A x B
+# curve grid (curve_utils.build_surface_grid) and sews them into
+# a shell, exported as STEP -- a finished surface model without
+# going through SolidWorks. Needs plane B: a single-direction cut
+# (3 points) has no perpendicular curve family to build a grid
+# with. Runs as a SEPARATE PROCESS in the dedicated .venv312 (see
+# README): the OpenCASCADE bindings this needs have no Windows
+# wheels for this script's own Python version, so they can't be
+# imported into this process directly.
+#
+# Current scope: only interior grid cells are filled. The outer
+# boundary ring is not stitched yet, so the exported shell is open
+# along the scan's perimeter rather than a fully closed solid.
+
+if use_plane_b:
+
+    print()
+    print("======================================")
+    print("SURFACE RECONSTRUCTION (STEP EXPORT)")
+    print("======================================")
+
+    venv_python = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        ".venv312",
+        "Scripts",
+        "python.exe"
+    )
+
+    step_export_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "step_export.py"
+    )
+
+    if not os.path.isfile(venv_python):
+
+        print(
+            "  Skipped: the dedicated Python 3.12 environment "
+            "(.venv312) was not found. See README.md, section "
+            "'Surface reconstruction (STEP export)', to set it up."
+        )
+
+    else:
+
+        surface_grid = build_surface_grid(
+            all_section_data,
+            found_intersections
+        )
+
+        print(
+            f"  {len(surface_grid['cells'])} interior grid "
+            f"cell(s) found."
+        )
+
+        if not surface_grid["cells"]:
+
+            print(
+                "  Skipped: no interior A x B grid cell was "
+                "found (need at least a 2x2 crossing grid)."
+            )
+
+        else:
+
+            grid_pickle_path = os.path.join(
+                output_dir,
+                "surface_grid.pickle"
+            )
+
+            with open(grid_pickle_path, "wb") as f:
+                pickle.dump(surface_grid, f)
+
+            step_path = os.path.join(
+                output_dir,
+                "reconstructed_surface.step"
+            )
+
+            result = subprocess.run(
+                [
+                    venv_python,
+                    step_export_script,
+                    grid_pickle_path,
+                    step_path
+                ],
+                capture_output=True,
+                text=True
+            )
+
+            if result.stdout:
+                print(result.stdout)
+
+            if result.returncode != 0:
+
+                print("  STEP export failed:")
+                print(result.stderr)
+
+            else:
+
+                print(f"  {step_path}")
+
+else:
+
+    print()
+    print(
+        "Plane B not used - surface reconstruction / STEP export "
+        "skipped (needs the A x B curve grid)."
+    )
+
+
+# ============================================================
+# 15. DONE
 # ============================================================
 
 print()

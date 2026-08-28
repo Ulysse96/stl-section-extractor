@@ -9,3 +9,5 @@
 # Python
 __pycache__/
 *.pyc
+.venv312/
+.pytest_cache/

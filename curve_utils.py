@@ -743,3 +743,264 @@ def build_simple_spline_curve(curve_3d, intersection_points):
     )
 
     return np.asarray(result, dtype=float)
+
+
+def segment_curve_at_indices(points, cut_indices):
+    """
+    Splits an ordered curve `points` into consecutive segments at
+    `cut_indices` (any order, duplicates and out-of-range values
+    ignored). Each returned segment shares its first/last point
+    with its neighbouring segment, so concatenating them (dropping
+    the duplicated join points) reproduces the original curve
+    exactly. The curve's own two endpoints are always segment
+    boundaries too, even if not listed in `cut_indices`.
+
+    Used to cut a section's main curve into the pieces bounding
+    each cell of the A x B surface-reconstruction grid, at the
+    points where it crosses the other curve family.
+    """
+
+    pts = np.asarray(points, dtype=float)
+
+    n = len(pts)
+
+    interior = {
+        int(s)
+        for s in cut_indices
+        if 0 <= int(s) <= n - 1
+    }
+
+    boundaries = sorted(interior | {0, n - 1})
+
+    return [
+        pts[boundaries[k]:boundaries[k + 1] + 1]
+        for k in range(len(boundaries) - 1)
+    ]
+
+
+def order_boundary_loop(points):
+    """
+    Orders an unordered set of 3D points that lie roughly on the
+    boundary of a disk-like patch (no holes) into a single closed
+    loop, by projecting them onto the patch's own best-fit plane
+    (via PCA) and sorting by angle around their centroid.
+
+    Used to turn the collection of open endpoints of every A/B
+    section curve -- which sit on the true edge of the scanned
+    surface -- into one ordered boundary loop. Assumes the
+    patch's boundary is star-shaped around its centroid once
+    projected (true for a cap/hat-like scan); not guaranteed for
+    an arbitrary/concave outline.
+
+    Returns the same points, reordered so consecutive rows are
+    consecutive around the loop (nothing is added, removed, or
+    moved).
+    """
+
+    pts = np.asarray(points, dtype=float)
+
+    centroid = pts.mean(axis=0)
+
+    centered = pts - centroid
+
+    # PCA via SVD: the two directions of largest spread define the
+    # patch's own 2D plane basis; the third (discarded) singular
+    # direction is the patch's normal.
+    _, _, vh = np.linalg.svd(centered, full_matrices=False)
+
+    basis_u = vh[0]
+    basis_v = vh[1]
+
+    u = centered @ basis_u
+    v = centered @ basis_v
+
+    angles = np.arctan2(v, u)
+
+    order = np.argsort(angles)
+
+    return pts[order]
+
+
+def collect_curve_endpoints(main_curves):
+    """
+    Collects the two open endpoints of every curve in `main_curves`
+    (a {(direction, number): points_3d} dict, as built by
+    build_surface_grid below) -- the points lying on the true edge
+    of the scanned patch. Meant to be fed into order_boundary_loop.
+    """
+
+    points = []
+
+    for curve_points in main_curves.values():
+
+        if len(curve_points) < 2:
+            continue
+
+        points.append(curve_points[0])
+        points.append(curve_points[-1])
+
+    return np.asarray(points, dtype=float)
+
+
+def build_surface_grid(all_section_data, found_intersections):
+    """
+    Assembles the A x B section curves into the grid used for
+    surface reconstruction: every curve is cut into segments at
+    its crossings with the other curve family (see
+    segment_curve_at_indices), the shared node at each crossing is
+    snapped to the exact same 3D point on both curves that meet
+    there (so adjacent patches share an edge exactly, with no
+    gap), and every interior 4-sided cell -- bounded by 2
+    consecutive A curves and 2 consecutive B curves -- is
+    collected with its 4 boundary edges, ready for a Coons patch.
+
+    Assumptions:
+    - Only the primary (k=0) crossing of each A_i x B_j plane pair
+      is used. A fold/defect producing more than one crossing
+      between the same pair is not represented in the grid.
+    - A curve's crossings are assumed to occur, along the curve's
+      own arc length, in the same order as the other family's
+      numbering (true for a reasonably regular, non-self-crossing
+      scan). Cells are only built where this and the crossing data
+      itself agree on all 4 corners; anything else is silently
+      skipped rather than guessed at.
+
+    Returns a dict:
+      "cells": list of {"a_i", "a_i_next", "b_j", "b_j_next",
+        "edge_a_lo", "edge_a_hi", "edge_b_lo", "edge_b_hi"} --
+        each edge_* an (N, 3) point array; edge_a_lo/edge_a_hi run
+        in the B direction (from the b_j corner to the b_j_next
+        corner) along curve A_i / A_(i_next) respectively, and
+        edge_b_lo/edge_b_hi run in the A direction along curve
+        B_j / B_(j_next). Adjacent cells share their common edge's
+        points exactly.
+      "boundary_edges": {(direction, number, "start"|"end"):
+        (N, 3) array} -- the outer part of each curve, from its
+        own open endpoint to its nearest crossing (or the whole
+        curve, if it has no crossing at all).
+      "main_curves": {(direction, number): (N, 3) array} -- the
+        curves actually used, for convenience (e.g. to build the
+        boundary loop via collect_curve_endpoints).
+    """
+
+    main_curves = {}
+
+    for data in all_section_data:
+
+        main_index = data["main_curve_index"]
+
+        if main_index is None:
+            continue
+
+        key = (data["direction"], data["number"])
+
+        main_curves[key] = np.asarray(
+            data["curves"][main_index]["points_3d"],
+            dtype=float
+        )
+
+    crossing_by_pair = {
+        (i, j): entry
+        for entry in found_intersections
+        for i, j, k in [entry["pair_id"]]
+        if k == 0
+    }
+
+    interior_edges = {}
+    boundary_edges = {}
+
+    for (direction, number), points in main_curves.items():
+
+        hits = []
+
+        for (i, j), entry in crossing_by_pair.items():
+
+            if direction == "A" and i == number:
+                hits.append((entry["idx_a"], j, entry["point"]))
+            elif direction == "B" and j == number:
+                hits.append((entry["idx_b"], i, entry["point"]))
+
+        if not hits:
+            continue
+
+        hits.sort(key=lambda h: h[0])
+
+        cut_indices = [idx for idx, _, _ in hits]
+
+        segments = segment_curve_at_indices(points, cut_indices)
+
+        segments = [seg.copy() for seg in segments]
+
+        for m, (_, _, snapped_point) in enumerate(hits):
+
+            segments[m][-1] = snapped_point
+            segments[m + 1][0] = snapped_point
+
+        boundary_edges[(direction, number, "start")] = segments[0]
+        boundary_edges[(direction, number, "end")] = segments[-1]
+
+        edges = {}
+
+        for m in range(len(hits) - 1):
+
+            lo = hits[m][1]
+            hi = hits[m + 1][1]
+
+            edges[(min(lo, hi), max(lo, hi))] = segments[m + 1]
+
+        interior_edges[(direction, number)] = edges
+
+    a_numbers = sorted(
+        {num for (d, num) in main_curves if d == "A"}
+    )
+
+    b_numbers = sorted(
+        {num for (d, num) in main_curves if d == "B"}
+    )
+
+    cells = []
+
+    for a_i, a_i_next in zip(a_numbers, a_numbers[1:]):
+
+        for b_j, b_j_next in zip(b_numbers, b_numbers[1:]):
+
+            edge_a_lo = interior_edges.get(("A", a_i), {}).get(
+                (b_j, b_j_next)
+            )
+
+            edge_a_hi = interior_edges.get(("A", a_i_next), {}).get(
+                (b_j, b_j_next)
+            )
+
+            edge_b_lo = interior_edges.get(("B", b_j), {}).get(
+                (a_i, a_i_next)
+            )
+
+            edge_b_hi = interior_edges.get(("B", b_j_next), {}).get(
+                (a_i, a_i_next)
+            )
+
+            if any(
+                edge is None
+                for edge in (edge_a_lo, edge_a_hi, edge_b_lo, edge_b_hi)
+            ):
+                continue
+
+            cells.append(
+                {
+                    "a_i": a_i,
+                    "a_i_next": a_i_next,
+                    "b_j": b_j,
+                    "b_j_next": b_j_next,
+                    "edge_a_lo": edge_a_lo,
+                    "edge_a_hi": edge_a_hi,
+                    "edge_b_lo": edge_b_lo,
+                    "edge_b_hi": edge_b_hi,
+                }
+            )
+
+    return {
+        "cells": cells,
+        "boundary_edges": boundary_edges,
+        "main_curves": main_curves,
+    }
