@@ -854,6 +854,16 @@ def build_surface_grid(all_section_data, found_intersections):
     consecutive A curves and 2 consecutive B curves -- is
     collected with its 4 boundary edges, ready for a Coons patch.
 
+    Each crossing's position along its two curves is found fresh, by
+    nearest point, against `points_3d` as given in `all_section_data`
+    -- not from the "idx_a"/"idx_b" stored in `found_intersections`,
+    which can be stale (reconstruction method 2 rebuilds every main
+    curve to a short "endpoints + intersections" polyline AFTER
+    find_all_intersections() computed those indices). This also means
+    the function gives the same result no matter which reconstruction
+    method was used, or whether curves were rebuilt before or after
+    it is called.
+
     Assumptions:
     - Only the primary (k=0) crossing of each A_i x B_j plane pair
       is used. A fold/defect producing more than one crossing
@@ -916,9 +926,28 @@ def build_surface_grid(all_section_data, found_intersections):
         for (i, j), entry in crossing_by_pair.items():
 
             if direction == "A" and i == number:
-                hits.append((entry["idx_a"], j, entry["point"]))
+                other_number = j
             elif direction == "B" and j == number:
-                hits.append((entry["idx_b"], i, entry["point"]))
+                other_number = i
+            else:
+                continue
+
+            # entry["idx_a"]/["idx_b"] locate the crossing on the
+            # curve as it stood when find_all_intersections() ran --
+            # but with reconstruction method 2, section_stl.py
+            # rebuilds every main curve (to a short "endpoints +
+            # intersections" polyline) AFTER that call, so those
+            # indices are stale by the time this function sees
+            # `points`. Re-locating each crossing by nearest point
+            # on the CURRENT curve is exact (the point is either
+            # still there unchanged, or -- after a method-2 rebuild
+            # -- was used verbatim to build the new curve) and works
+            # the same way regardless of reconstruction method or
+            # when this function is called relative to the rebuild.
+            target = np.asarray(entry["point"], dtype=float)
+            idx = int(np.argmin(np.sum((points - target) ** 2, axis=1)))
+
+            hits.append((idx, other_number, entry["point"]))
 
         if not hits:
             continue

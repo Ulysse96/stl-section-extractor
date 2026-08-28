@@ -515,6 +515,31 @@ def test_build_surface_grid_handles_a_crossing_at_the_curve_endpoint():
     assert isinstance(grid["cells"], list)
 
 
+def test_build_surface_grid_ignores_stale_idx_after_curve_rebuild():
+    # Regression test for the "0 interior grid cells found" bug:
+    # reconstruction method 2 rebuilds every main curve to a short
+    # "start + intersections + end" polyline AFTER
+    # find_all_intersections() already computed idx_a/idx_b against
+    # the long, pre-rebuild curve -- so those indices are stale by
+    # the time build_surface_grid runs. It must locate each crossing
+    # by nearest point on the CURRENT curve instead, ignoring
+    # idx_a/idx_b entirely, so a real (very wrong, out-of-range)
+    # stale index must not prevent the grid from being built.
+    all_section_data, found_intersections = _make_lattice_grid_inputs()
+
+    for entry in found_intersections:
+        # Deliberately bogus: as if computed against a 500-point
+        # curve that no longer exists by the time this runs.
+        entry["idx_a"] = 483
+        entry["idx_b"] = 271
+
+    grid = build_surface_grid(all_section_data, found_intersections)
+
+    # Same lattice as the non-stale-index test: still finds the
+    # full 2x2 interior grid, proving idx_a/idx_b were ignored.
+    assert len(grid["cells"]) == 4
+
+
 def test_collect_curve_endpoints_gathers_both_ends_of_every_curve():
     all_section_data, found_intersections = _make_lattice_grid_inputs()
 
