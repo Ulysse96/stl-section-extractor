@@ -1598,6 +1598,18 @@ for data in all_section_data:
             dtype=float
         )
 
+# The scanned patch's outline: a closed loop through the ordered
+# open endpoints of every A/B curve, built from the same
+# full-resolution snapshot above rather than a possibly-simplified
+# curve. Computed once here so it can be included both in
+# sections_main_3d.dxf (step 13.3) and its own boundary_loop.dxf
+# (step 13.5), and reused by surface reconstruction later.
+boundary_loop_points = (
+    order_boundary_loop(collect_curve_endpoints(rich_main_curves))
+    if len(rich_main_curves) >= 3
+    else None
+)
+
 
 # ============================================================
 # 12ter. FIND A x B INTERSECTIONS ON THE FINAL CURVES
@@ -2432,6 +2444,19 @@ for data in all_section_data:
 
     msp3d.add_spline(fit_points=points)
 
+if boundary_loop_points is not None:
+
+    closed_boundary_points = np.vstack(
+        [boundary_loop_points, boundary_loop_points[0:1]]
+    )
+
+    msp3d.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_boundary_points
+        ]
+    )
+
 doc3d.saveas(dxf_path_3d)
 
 print(dxf_path_3d)
@@ -2481,21 +2506,16 @@ if use_plane_b and found_intersections:
 
 
 # --------------------------------------------------------
-# 13.5 boundary_loop : une seule spline fermee reliant, dans
-#      l'ordre, les extremites de toutes les courbes de coupe --
-#      le contour du patch scanne. Construite a partir de
-#      rich_main_curves (avant simplification eventuelle par la
-#      methode 2), pour la meme raison que step 14 ci-dessous.
+# 13.5 boundary_loop : la meme spline fermee deja added a
+#      sections_main_3d.dxf (step 13.3), aussi ecrite dans son
+#      propre fichier pour qu'elle soit facile a isoler/reutiliser
+#      seule (ex: fermer la coque en step 14).
 # --------------------------------------------------------
 
-if len(rich_main_curves) >= 3:
+if boundary_loop_points is not None:
 
     print()
     print("--- boundary_loop ---")
-
-    boundary_points = order_boundary_loop(
-        collect_curve_endpoints(rich_main_curves)
-    )
 
     boundary_path = os.path.join(
         dir3d,
@@ -2505,14 +2525,14 @@ if len(rich_main_curves) >= 3:
     doc_boundary = new_dxf_document()
     msp_boundary = doc_boundary.modelspace()
 
-    closed_points = np.vstack(
-        [boundary_points, boundary_points[0:1]]
+    closed_boundary_points = np.vstack(
+        [boundary_loop_points, boundary_loop_points[0:1]]
     )
 
     msp_boundary.add_spline(
         fit_points=[
             (float(p[0]), float(p[1]), float(p[2]))
-            for p in closed_points
+            for p in closed_boundary_points
         ]
     )
 
