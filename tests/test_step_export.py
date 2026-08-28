@@ -159,3 +159,75 @@ def test_build_single_surface_smooths_a_sharp_local_fold():
     # Well under half the fold's own amplitude survives -- the sharp
     # local feature is smoothed away, not reproduced.
     assert fold_retained < fold_amplitude * 0.5
+
+
+def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypatch):
+    # A real, complex shape can be too much for a single low-degree
+    # surface to fit at the user's requested tolerance without
+    # folding over itself, even with a clean boundary loop -- a
+    # looser tolerance gives OpenCASCADE more room to find a valid
+    # fit. Rather than making the user manually re-run the whole
+    # pipeline with a bigger number, build_step_surfaces retries a
+    # few times with a progressively looser tolerance itself. Mocks
+    # build_single_surface directly (real geometry that reliably
+    # fails at one tolerance and succeeds at another isn't practical
+    # to construct synthetically) to check the retry control flow
+    # itself: fails twice, succeeds on the third, real attempt.
+    import step_export
+
+    calls = []
+
+    real_build_single_surface = step_export.build_single_surface
+
+    def flaky_build_single_surface(boundary, interior, tolerance):
+        calls.append(tolerance)
+        if len(calls) < 3:
+            raise RuntimeError("simulated fill failure")
+        return real_build_single_surface(boundary, interior, tolerance)
+
+    monkeypatch.setattr(
+        step_export, "build_single_surface", flaky_build_single_surface
+    )
+
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "boundary_loop": boundary,
+        "interior_curves": interior_curves,
+        "smoothing_tolerance_mm": 0.3,
+    }
+
+    output_path = tmp_path / "surface.step"
+
+    step_export.build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+    assert len(calls) == 3
+    # Each retry loosens by RETRY_TOLERANCE_FACTOR from the original.
+    assert calls[0] == pytest.approx(0.3)
+    assert calls[1] > calls[0]
+    assert calls[2] > calls[1]
+
+
+def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
+    import step_export
+
+    def always_fails(boundary, interior, tolerance):
+        raise RuntimeError("simulated fill failure")
+
+    monkeypatch.setattr(step_export, "build_single_surface", always_fails)
+
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "boundary_loop": boundary,
+        "interior_curves": interior_curves,
+        "smoothing_tolerance_mm": 0.3,
+    }
+
+    try:
+        step_export.build_step_surfaces(data, "unused.step")
+    except RuntimeError as exc:
+        assert "retries" in str(exc)
+    else:
+        raise AssertionError("expected a RuntimeError after exhausting retries")

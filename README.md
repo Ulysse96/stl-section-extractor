@@ -123,7 +123,11 @@ aggressively small local folds/wrinkles get smoothed away — larger
 values smooth more (and build faster); smaller values follow the scan
 more closely. 2–5 mm is a reasonable starting point; the field is right
 there in the same form as the other reconstruction settings, so it's
-easy to re-run with a different value and compare.
+easy to re-run with a different value and compare. If the fill fails at
+the requested tolerance (a genuinely complex real shape can be too much
+for a single low-degree surface to fit without folding over itself),
+`step_export.py` automatically retries a few times with a progressively
+looser tolerance before giving up, and reports which one worked.
 
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed

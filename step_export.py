@@ -211,21 +211,77 @@ def write_step(shape, output_path):
         )
 
 
+# How many times to retry with a looser tolerance if a fill fails --
+# and by what factor each retry loosens smoothing_tolerance_mm. A
+# real, complex shape (e.g. the dome/brim/rear of a hat, all in one
+# surface) can be too much for a single low-degree B-spline to fit
+# without folding over itself at the tolerance the user picked, even
+# once the boundary loop itself is clean; a looser tolerance gives
+# OpenCASCADE more room to find a valid (if less detailed) fit. Saves
+# a manual guess-and-check cycle re-running the whole pipeline for.
+RETRY_TOLERANCE_FACTOR = 2.5
+MAX_RETRIES = 3
+
+
 def build_step_surfaces(data, output_path):
     """
     Entry point: takes the dict pickled by section_stl.py
     ({"boundary_loop": ..., "interior_curves": ...,
     "smoothing_tolerance_mm": ...}) and writes the single
     reconstructed surface to `output_path`.
+
+    If the fill fails at the requested smoothing tolerance, retries
+    a few times with a progressively looser one (see
+    RETRY_TOLERANCE_FACTOR/MAX_RETRIES) before giving up -- see the
+    comment above those constants for why this can help. Prints which
+    tolerance actually succeeded when a retry was needed.
     """
 
-    face = build_single_surface(
-        data["boundary_loop"],
-        data["interior_curves"],
-        data.get("smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM)
-    )
+    tolerance = data.get("smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM)
 
-    write_step(face, output_path)
+    last_error = None
+
+    for attempt in range(MAX_RETRIES + 1):
+
+        try:
+
+            face = build_single_surface(
+                data["boundary_loop"],
+                data["interior_curves"],
+                tolerance
+            )
+
+            if attempt > 0:
+                print(
+                    f"Succeeded at a looser smoothing tolerance: "
+                    f"{tolerance:.2f} mm (requested: "
+                    f"{data.get('smoothing_tolerance_mm', DEFAULT_SMOOTHING_TOLERANCE_MM):.2f} mm)"
+                )
+
+            write_step(face, output_path)
+
+            return
+
+        except RuntimeError as exc:
+
+            last_error = exc
+
+            if attempt < MAX_RETRIES:
+
+                print(
+                    f"Fill failed at {tolerance:.2f} mm ({exc}); "
+                    f"retrying at "
+                    f"{tolerance * RETRY_TOLERANCE_FACTOR:.2f} mm..."
+                )
+
+            tolerance *= RETRY_TOLERANCE_FACTOR
+
+    raise RuntimeError(
+        f"Could not build a valid surface even after {MAX_RETRIES} "
+        f"retries with looser tolerances (last tried: "
+        f"{tolerance / RETRY_TOLERANCE_FACTOR:.2f} mm). Last error: "
+        f"{last_error}"
+    ) from last_error
 
 
 def main():
