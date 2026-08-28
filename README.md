@@ -129,6 +129,18 @@ for a single low-degree surface to fit without folding over itself),
 `step_export.py` automatically retries a few times with a progressively
 looser tolerance before giving up, and reports which one worked.
 
+**Why a "successful" STEP file can still be unusable**: OpenCASCADE's own
+validity check (`BRepCheck_Analyzer`) only catches *topological* problems
+(e.g. self-intersection) — it does not notice a degree-8 B-spline
+surface whose control points oscillated far outside the scan's real size
+(Runge's phenomenon), which happened on a real hat scan: the fill
+"succeeded" at a looser retry tolerance, but the resulting surface's
+control points reached ±20 metres for an object a few hundred mm across,
+and SolidWorks couldn't open the file properly. `step_export.py` now
+also checks the fitted surface's own bounding box against the input
+curves' extent and treats a wildly oversized surface as a failure,
+feeding into the same retry-with-looser-tolerance mechanism above.
+
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed
 spline through the ordered open endpoints of every A/B curve — the

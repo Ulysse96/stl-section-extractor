@@ -18,7 +18,11 @@ import pytest
 
 pytest.importorskip("OCP")
 
-from step_export import build_single_surface, build_step_surfaces
+from step_export import (
+    build_single_surface,
+    build_step_surfaces,
+    _surface_exceeds_input_bounds,
+)
 
 
 def _dome_z(x, y):
@@ -207,6 +211,42 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
     assert calls[0] == pytest.approx(0.3)
     assert calls[1] > calls[0]
     assert calls[2] > calls[1]
+
+
+def test_surface_exceeds_input_bounds_accepts_a_surface_near_its_input():
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
+    )
+
+    near_face = BRepBuilderAPI_MakeFace(
+        gp_Pln(gp_Pnt(0.5, 0.5, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
+    ).Face()
+
+    assert not _surface_exceeds_input_bounds(near_face, input_points, [input_points])
+
+
+def test_surface_exceeds_input_bounds_rejects_a_surface_far_from_its_input():
+    # Regression test for the real failure this project hit: a
+    # topologically valid surface whose control points blew up far
+    # outside the scan's own extent (see step_export.py's module-level
+    # comment on _surface_exceeds_input_bounds / MAX_SURFACE_BBOX_EXPANSION_FACTOR).
+    # Stands in for that blowup with a face deliberately placed tens of
+    # thousands of units away from tiny input curves.
+    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
+    )
+
+    far_face = BRepBuilderAPI_MakeFace(
+        gp_Pln(gp_Pnt(20000, 20000, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
+    ).Face()
+
+    assert _surface_exceeds_input_bounds(far_face, input_points, [input_points])
 
 
 def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):

@@ -48,10 +48,71 @@ from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
+from OCP.Bnd import Bnd_Box
+from OCP.BRepBndLib import BRepBndLib
 from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
+
+
+# How far a fitted surface's own bounding box may extend beyond the
+# input curves' bounding box, as a multiple of that box's diagonal.
+# BRepCheck_Analyzer only catches topological invalidity (e.g.
+# self-intersection); it does NOT catch a degree-8 B-spline surface
+# whose control points oscillated (Runge's phenomenon) into
+# thousands of mm for a scan whose real extent is a few hundred --
+# "topologically valid" but visibly unusable garbage, confirmed on
+# the real scan: a retry at a looser tolerance "succeeded" by this
+# measure while its control points reached +-20 metres for a hat.
+# This is a plain sanity check on the fitted surface's own extent,
+# not a topology one -- same idea as the equivalent check the
+# earlier per-cell version of this module had (_face_exceeds_input_bounds),
+# lost when this was rebuilt as a single surface.
+MAX_SURFACE_BBOX_EXPANSION_FACTOR = 3.0
+
+
+def _surface_exceeds_input_bounds(face, boundary_points, interior_curves):
+
+    all_points = [np.asarray(boundary_points, dtype=float)]
+
+    for curve_points in interior_curves:
+
+        points = np.asarray(curve_points, dtype=float)
+
+        if len(points) >= 1:
+            all_points.append(points)
+
+    stacked = np.vstack(all_points)
+
+    input_min = stacked.min(axis=0)
+    input_max = stacked.max(axis=0)
+
+    diagonal = float(np.linalg.norm(input_max - input_min))
+    margin = max(diagonal, 1e-6) * MAX_SURFACE_BBOX_EXPANSION_FACTOR
+
+    box = Bnd_Box()
+
+    # AddOptimal_s (not the plain Add_s) matters here: Add_s falls
+    # back to a much looser bound (essentially the raw B-spline
+    # control net) whenever the face has no triangulation attached,
+    # which it doesn't at this point in the pipeline -- confirmed
+    # directly (a small, perfectly reasonable synthetic surface
+    # measured a bounding box up to Z=160 with Add_s, vs Z=11 with
+    # AddOptimal_s, for input data whose own Z only spans -0.12 to
+    # 0.30). Add_s would false-positive on normal surfaces here.
+    BRepBndLib.AddOptimal_s(face, box, True, False)
+
+    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+
+    face_min = np.array([xmin, ymin, zmin])
+    face_max = np.array([xmax, ymax, zmax])
+
+    return bool(
+        np.any(face_min < input_min - margin)
+        or
+        np.any(face_max > input_max + margin)
+    )
 
 
 # Default "how much may the surface deviate from the raw curve
@@ -110,9 +171,12 @@ def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_m
     was chosen over a per-cell patchwork.
 
     Raises RuntimeError if OpenCASCADE fails to build the surface,
-    or builds one that is not a topologically valid B-rep face
-    (checked with BRepCheck_Analyzer rather than trusting the
-    algorithm's own "done" status alone).
+    builds one that is not a topologically valid B-rep face (checked
+    with BRepCheck_Analyzer rather than trusting the algorithm's own
+    "done" status alone), or builds a topologically "valid" surface
+    whose control points blew up far outside the input curves' own
+    extent (see _surface_exceeds_input_bounds) -- a real failure
+    mode on a genuinely complex shape, not just a hypothetical one.
     """
 
     filler = BRepOffsetAPI_MakeFilling(
@@ -175,6 +239,15 @@ def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_m
         raise RuntimeError(
             "OpenCASCADE built a surface but it is geometrically "
             "invalid (likely self-intersecting)."
+        )
+
+    if _surface_exceeds_input_bounds(face, boundary_points, interior_curves):
+        raise RuntimeError(
+            "OpenCASCADE built a topologically valid surface, but "
+            "its control points blew up far outside the scan's own "
+            "extent (a degree-8 B-spline surface can oscillate wildly "
+            "-- Runge's phenomenon -- when the shape is too complex "
+            "for its degree at this tolerance)."
         )
 
     return face
