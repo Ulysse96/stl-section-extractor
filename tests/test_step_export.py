@@ -21,8 +21,13 @@ pytest.importorskip("OCP")
 from step_export import (
     build_single_surface,
     build_step_surfaces,
-    _surface_exceeds_input_bounds,
+    _control_points_exceed_local_scale,
 )
+
+# _synthetic_patch's curves are spaced 4 / (5 - 1) = 1.0 apart, both
+# directions -- standing in for section_stl.py's
+# width_a/(number_of_sections_a - 1).
+SECTION_SPACING_MM = 1.0
 
 
 def _dome_z(x, y):
@@ -65,7 +70,10 @@ def _synthetic_patch():
 def test_build_single_surface_produces_one_valid_face():
     boundary, interior_curves = _synthetic_patch()
 
-    face = build_single_surface(boundary, interior_curves, smoothing_tolerance_mm=0.3)
+    face = build_single_surface(
+        boundary, interior_curves,
+        smoothing_tolerance_mm=0.3, section_spacing_mm=SECTION_SPACING_MM
+    )
 
     assert face is not None
 
@@ -86,7 +94,8 @@ def test_build_single_surface_closes_an_open_boundary_loop():
     assert not np.allclose(open_boundary[0], open_boundary[-1])
 
     face = build_single_surface(
-        open_boundary, interior_curves, smoothing_tolerance_mm=0.3
+        open_boundary, interior_curves,
+        smoothing_tolerance_mm=0.3, section_spacing_mm=SECTION_SPACING_MM
     )
 
     assert face is not None
@@ -99,6 +108,7 @@ def test_build_step_surfaces_writes_a_valid_step_file_with_one_face(tmp_path):
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
+        "section_spacing_mm": SECTION_SPACING_MM,
     }
 
     output_path = tmp_path / "surface.step"
@@ -147,7 +157,10 @@ def test_build_single_surface_smooths_a_sharp_local_fold():
 
     boundary, _ = _synthetic_patch()
 
-    face = build_single_surface(boundary, interior_curves, smoothing_tolerance_mm=0.05)
+    face = build_single_surface(
+        boundary, interior_curves,
+        smoothing_tolerance_mm=0.05, section_spacing_mm=SECTION_SPACING_MM
+    )
 
     from OCP.gp import gp_Pnt
     from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
@@ -183,11 +196,11 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
 
     real_build_single_surface = step_export.build_single_surface
 
-    def flaky_build_single_surface(boundary, interior, tolerance):
+    def flaky_build_single_surface(boundary, interior, tolerance, section_spacing_mm):
         calls.append(tolerance)
         if len(calls) < 3:
             raise RuntimeError("simulated fill failure")
-        return real_build_single_surface(boundary, interior, tolerance)
+        return real_build_single_surface(boundary, interior, tolerance, section_spacing_mm)
 
     monkeypatch.setattr(
         step_export, "build_single_surface", flaky_build_single_surface
@@ -199,6 +212,7 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
+        "section_spacing_mm": SECTION_SPACING_MM,
     }
 
     output_path = tmp_path / "surface.step"
@@ -213,46 +227,67 @@ def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypat
     assert calls[2] > calls[1]
 
 
-def test_surface_exceeds_input_bounds_accepts_a_surface_near_its_input():
-    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
+def _make_bezier_face(corners):
+    # A minimal (2x2 pole, degree-1) B-rep face with EXACTLY the
+    # given corner points as its control points -- lets these tests
+    # place a face's raw control points precisely, without going
+    # through the (expensive, and not fully controllable) filling
+    # algorithm.
+    from OCP.gp import gp_Pnt
+    from OCP.TColgp import TColgp_Array2OfPnt
+    from OCP.Geom import Geom_BezierSurface
     from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
 
+    poles = TColgp_Array2OfPnt(1, 2, 1, 2)
+    for i in range(2):
+        for j in range(2):
+            x, y, z = corners[i][j]
+            poles.SetValue(i + 1, j + 1, gp_Pnt(float(x), float(y), float(z)))
+
+    surface = Geom_BezierSurface(poles)
+    return BRepBuilderAPI_MakeFace(surface, 1e-6).Face()
+
+
+def test_control_points_exceed_local_scale_accepts_a_surface_near_its_input():
     input_points = np.array(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
     )
 
-    near_face = BRepBuilderAPI_MakeFace(
-        gp_Pln(gp_Pnt(0.5, 0.5, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
-    ).Face()
+    near_face = _make_bezier_face(
+        [[[0, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0]]]
+    )
 
-    assert not _surface_exceeds_input_bounds(near_face, input_points, [input_points])
+    assert not _control_points_exceed_local_scale(
+        near_face, input_points, [input_points], section_spacing_mm=1.0
+    )
 
 
-def test_surface_exceeds_input_bounds_rejects_a_surface_far_from_its_input():
+def test_control_points_exceed_local_scale_rejects_a_surface_far_from_its_input():
     # Regression test for the real failure this project hit: a
-    # topologically valid surface whose control points blew up far
-    # outside the scan's own extent (see step_export.py's module-level
-    # comment on _surface_exceeds_input_bounds / MAX_SURFACE_BBOX_EXPANSION_FACTOR).
-    # Stands in for that blowup with a face deliberately placed tens of
+    # topologically valid surface whose raw control points blew up
+    # far beyond the scan's local grid spacing (see step_export.py's
+    # module-level comment on _control_points_exceed_local_scale /
+    # MAX_POLE_DEVIATION_FACTOR). Stands in for that blowup with a
+    # face whose control points are deliberately placed tens of
     # thousands of units away from tiny input curves.
-    from OCP.gp import gp_Pnt, gp_Dir, gp_Pln
-    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-
     input_points = np.array(
         [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
     )
 
-    far_face = BRepBuilderAPI_MakeFace(
-        gp_Pln(gp_Pnt(20000, 20000, 0), gp_Dir(0, 0, 1)), 0, 1, 0, 1
-    ).Face()
+    far_face = _make_bezier_face(
+        [[[20000, 20000, 0], [20000, 20001, 0]],
+         [[20001, 20000, 0], [20001, 20001, 0]]]
+    )
 
-    assert _surface_exceeds_input_bounds(far_face, input_points, [input_points])
+    assert _control_points_exceed_local_scale(
+        far_face, input_points, [input_points], section_spacing_mm=1.0
+    )
 
 
 def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
     import step_export
 
-    def always_fails(boundary, interior, tolerance):
+    def always_fails(boundary, interior, tolerance, section_spacing_mm):
         raise RuntimeError("simulated fill failure")
 
     monkeypatch.setattr(step_export, "build_single_surface", always_fails)
@@ -263,6 +298,7 @@ def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
         "boundary_loop": boundary,
         "interior_curves": interior_curves,
         "smoothing_tolerance_mm": 0.3,
+        "section_spacing_mm": SECTION_SPACING_MM,
     }
 
     try:

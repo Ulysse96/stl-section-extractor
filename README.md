@@ -131,15 +131,34 @@ looser tolerance before giving up, and reports which one worked.
 
 **Why a "successful" STEP file can still be unusable**: OpenCASCADE's own
 validity check (`BRepCheck_Analyzer`) only catches *topological* problems
-(e.g. self-intersection) — it does not notice a degree-8 B-spline
-surface whose control points oscillated far outside the scan's real size
-(Runge's phenomenon), which happened on a real hat scan: the fill
-"succeeded" at a looser retry tolerance, but the resulting surface's
-control points reached ±20 metres for an object a few hundred mm across,
-and SolidWorks couldn't open the file properly. `step_export.py` now
-also checks the fitted surface's own bounding box against the input
-curves' extent and treats a wildly oversized surface as a failure,
-feeding into the same retry-with-looser-tolerance mechanism above.
+(e.g. self-intersection) — it does not notice a B-spline surface whose
+control points oscillated far outside the scan's real size (Runge's
+phenomenon), which happened on a real hat scan: the fill "succeeded",
+but the resulting surface's control points reached tens of thousands of
+mm for an object a few hundred mm across, and SolidWorks couldn't open
+the file properly.
+
+`step_export.py` now also checks the fitted surface's own raw control
+points against `section_spacing_mm` (the real distance between adjacent
+parallel cutting planes) and treats a wildly oversized surface as a
+failure, feeding into the retry-with-looser-tolerance mechanism above. An
+earlier version of this check compared against the whole object's
+overall size instead, which turned out not to work: a real, non-flat
+scan shows comparable *relative* overshoot whether the surface is fine
+or badly blown up, so that version let real blowups through. Checking
+against the local grid spacing instead gave a clean, wide separation
+between a known-good surface and a broken one.
+
+**Excluding an edge section can itself break the fill**: confirmed
+directly on a real scan — excluding a section at the very edge of the
+grid (e.g. `A1`, the first plane-A section, `A11`/`B11`, the last ones)
+removes the only nearby guide curve holding the surface down right at
+that part of the boundary, and the fill can bulge uncontrollably there
+regardless of tolerance, surface degree, or curve sampling density (all
+tested directly, none fixed it). If the surface keeps failing after
+excluding an outermost section, that's the likely cause — for now, the
+safest option is to keep edge sections in and exclude only interior
+ones where a hole allows it.
 
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed

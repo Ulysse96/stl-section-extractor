@@ -48,31 +48,39 @@ from OCP.GeomAbs import GeomAbs_C0, GeomAbs_Shape
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
 from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeFilling
 from OCP.BRepCheck import BRepCheck_Analyzer
-from OCP.Bnd import Bnd_Box
-from OCP.BRepBndLib import BRepBndLib
+from OCP.BRep import BRep_Tool
 from OCP.TopoDS import TopoDS
 from OCP.STEPControl import STEPControl_Writer, STEPControl_StepModelType
 from OCP.Interface import Interface_Static
 from OCP.IFSelect import IFSelect_ReturnStatus
 
 
-# How far a fitted surface's own bounding box may extend beyond the
-# input curves' bounding box, as a multiple of that box's diagonal.
+# How far a fitted surface's raw B-spline control points may sit
+# beyond the input curves' own bounding box, as a multiple of
+# section_spacing_mm (the real distance between adjacent parallel
+# cutting planes -- the data's natural local length scale).
 # BRepCheck_Analyzer only catches topological invalidity (e.g.
 # self-intersection); it does NOT catch a degree-8 B-spline surface
 # whose control points oscillated (Runge's phenomenon) into
-# thousands of mm for a scan whose real extent is a few hundred --
-# "topologically valid" but visibly unusable garbage, confirmed on
-# the real scan: a retry at a looser tolerance "succeeded" by this
-# measure while its control points reached +-20 metres for a hat.
-# This is a plain sanity check on the fitted surface's own extent,
-# not a topology one -- same idea as the equivalent check the
-# earlier per-cell version of this module had (_face_exceeds_input_bounds),
-# lost when this was rebuilt as a single surface.
-MAX_SURFACE_BBOX_EXPANSION_FACTOR = 3.0
+# thousands of mm for a scan whose real extent is a few hundred.
+#
+# An earlier version of this check compared the surface's own
+# (trimmed, AddOptimal_s) bounding box to a multiple of the WHOLE
+# object's diagonal instead. That could not actually tell a good
+# surface from a bad one: a real, non-flat scan (a hat, not a flat
+# test plate) shows comparable *relative* overshoot in both cases.
+# Measured directly against this project's own known-good synthetic
+# test surface and a real, broken hat export: the good surface's raw
+# control points overshoot the input bounding box by up to ~160x the
+# local grid spacing; the broken hat overshoots by 1150-2190x -- a
+# clean, wide gap the diagonal-relative check could not see, because
+# on that metric both cases looked similar.
+MAX_POLE_DEVIATION_FACTOR = 300
 
 
-def _surface_exceeds_input_bounds(face, boundary_points, interior_curves):
+def _control_points_exceed_local_scale(
+    face, boundary_points, interior_curves, section_spacing_mm
+):
 
     all_points = [np.asarray(boundary_points, dtype=float)]
 
@@ -88,31 +96,28 @@ def _surface_exceeds_input_bounds(face, boundary_points, interior_curves):
     input_min = stacked.min(axis=0)
     input_max = stacked.max(axis=0)
 
-    diagonal = float(np.linalg.norm(input_max - input_min))
-    margin = max(diagonal, 1e-6) * MAX_SURFACE_BBOX_EXPANSION_FACTOR
+    # BRepOffsetAPI_MakeFilling always produces a Geom_BSplineSurface,
+    # so Pole()/NbUPoles()/NbVPoles() are always available here.
+    surface = BRep_Tool.Surface_s(face)
 
-    box = Bnd_Box()
+    poles = np.array([
+        [
+            surface.Pole(i, j).X(),
+            surface.Pole(i, j).Y(),
+            surface.Pole(i, j).Z(),
+        ]
+        for i in range(1, surface.NbUPoles() + 1)
+        for j in range(1, surface.NbVPoles() + 1)
+    ])
 
-    # AddOptimal_s (not the plain Add_s) matters here: Add_s falls
-    # back to a much looser bound (essentially the raw B-spline
-    # control net) whenever the face has no triangulation attached,
-    # which it doesn't at this point in the pipeline -- confirmed
-    # directly (a small, perfectly reasonable synthetic surface
-    # measured a bounding box up to Z=160 with Add_s, vs Z=11 with
-    # AddOptimal_s, for input data whose own Z only spans -0.12 to
-    # 0.30). Add_s would false-positive on normal surfaces here.
-    BRepBndLib.AddOptimal_s(face, box, True, False)
+    pole_min = poles.min(axis=0)
+    pole_max = poles.max(axis=0)
 
-    xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
+    threshold = max(section_spacing_mm, 1e-6) * MAX_POLE_DEVIATION_FACTOR
 
-    face_min = np.array([xmin, ymin, zmin])
-    face_max = np.array([xmax, ymax, zmax])
+    overshoot = np.maximum(input_min - pole_min, pole_max - input_max)
 
-    return bool(
-        np.any(face_min < input_min - margin)
-        or
-        np.any(face_max > input_max + margin)
-    )
+    return bool(np.any(overshoot > threshold))
 
 
 # Default "how much may the surface deviate from the raw curve
@@ -159,7 +164,9 @@ def edge_from_points(points, tolerance_mm):
     ).Edge()
 
 
-def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_mm):
+def build_single_surface(
+    boundary_points, interior_curves, smoothing_tolerance_mm, section_spacing_mm
+):
     """
     Builds ONE TopoDS_Face covering the whole scanned patch: the
     closed `boundary_points` loop is the surface's bounding wire,
@@ -170,13 +177,19 @@ def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_m
     combination (one free-form fill, boundary + internal guides)
     was chosen over a per-cell patchwork.
 
+    `section_spacing_mm` is the real distance between adjacent
+    parallel cutting planes (section_stl.py's width_a/(count_a-1) or
+    width_b/(count_b-1)) -- the data's natural local length scale,
+    used by the control-point sanity check below.
+
     Raises RuntimeError if OpenCASCADE fails to build the surface,
     builds one that is not a topologically valid B-rep face (checked
     with BRepCheck_Analyzer rather than trusting the algorithm's own
     "done" status alone), or builds a topologically "valid" surface
-    whose control points blew up far outside the input curves' own
-    extent (see _surface_exceeds_input_bounds) -- a real failure
-    mode on a genuinely complex shape, not just a hypothetical one.
+    whose control points blew up far beyond the input curves' own
+    extent (see _control_points_exceed_local_scale) -- a real
+    failure mode on a genuinely complex shape, not just a
+    hypothetical one.
     """
 
     filler = BRepOffsetAPI_MakeFilling(
@@ -241,11 +254,13 @@ def build_single_surface(boundary_points, interior_curves, smoothing_tolerance_m
             "invalid (likely self-intersecting)."
         )
 
-    if _surface_exceeds_input_bounds(face, boundary_points, interior_curves):
+    if _control_points_exceed_local_scale(
+        face, boundary_points, interior_curves, section_spacing_mm
+    ):
         raise RuntimeError(
             "OpenCASCADE built a topologically valid surface, but "
-            "its control points blew up far outside the scan's own "
-            "extent (a degree-8 B-spline surface can oscillate wildly "
+            "its control points blew up far beyond the scan's local "
+            "grid spacing (a B-spline surface can oscillate wildly "
             "-- Runge's phenomenon -- when the shape is too complex "
             "for its degree at this tolerance)."
         )
@@ -300,8 +315,8 @@ def build_step_surfaces(data, output_path):
     """
     Entry point: takes the dict pickled by section_stl.py
     ({"boundary_loop": ..., "interior_curves": ...,
-    "smoothing_tolerance_mm": ...}) and writes the single
-    reconstructed surface to `output_path`.
+    "smoothing_tolerance_mm": ..., "section_spacing_mm": ...}) and
+    writes the single reconstructed surface to `output_path`.
 
     If the fill fails at the requested smoothing tolerance, retries
     a few times with a progressively looser one (see
@@ -321,7 +336,8 @@ def build_step_surfaces(data, output_path):
             face = build_single_surface(
                 data["boundary_loop"],
                 data["interior_curves"],
-                tolerance
+                tolerance,
+                data["section_spacing_mm"]
             )
 
             if attempt > 0:
