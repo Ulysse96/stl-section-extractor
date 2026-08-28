@@ -18,6 +18,8 @@ from curve_utils import (
     find_curve_crossings,
     build_simple_spline_curve,
     build_surface_grid,
+    collect_curve_endpoints,
+    order_boundary_loop,
 )
 
 
@@ -2476,6 +2478,47 @@ if use_plane_b and found_intersections:
     doc_int.saveas(dxf_path_intersections)
 
     print(dxf_path_intersections)
+
+
+# --------------------------------------------------------
+# 13.5 boundary_loop : une seule spline fermee reliant, dans
+#      l'ordre, les extremites de toutes les courbes de coupe --
+#      le contour du patch scanne. Construite a partir de
+#      rich_main_curves (avant simplification eventuelle par la
+#      methode 2), pour la meme raison que step 14 ci-dessous.
+# --------------------------------------------------------
+
+if len(rich_main_curves) >= 3:
+
+    print()
+    print("--- boundary_loop ---")
+
+    boundary_points = order_boundary_loop(
+        collect_curve_endpoints(rich_main_curves)
+    )
+
+    boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop.dxf"
+    )
+
+    doc_boundary = new_dxf_document()
+    msp_boundary = doc_boundary.modelspace()
+
+    closed_points = np.vstack(
+        [boundary_points, boundary_points[0:1]]
+    )
+
+    msp_boundary.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_points
+        ]
+    )
+
+    doc_boundary.saveas(boundary_path)
+
+    print(boundary_path)
 
 
 # ============================================================

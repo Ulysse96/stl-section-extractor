@@ -113,3 +113,16 @@ smoother-looking result — same principle as a denser mesh reading as
 smoother. Cells with a geometrically invalid fill (typically at a
 fold/defect in the scan) are detected and skipped, reported by name
 rather than silently exported.
+
+Cell edges are also used as-is from `all_section_data`/the curve
+snapshot rather than being re-fit into a genuinely smooth spline before
+building the surface — `step_export.py` fits an approximating (not
+interpolating) B-spline near each edge's points instead of threading
+through every one of them exactly, which is what removed a "torn,
+raw-looking" surface on a real scan.
+
+`section_stl.py` also exports `sections_3d/boundary_loop.dxf`: a single
+closed spline through the ordered open endpoints of every A/B curve —
+the outline of the scanned patch — built from the same full-resolution
+curve snapshot the STEP export uses, not from reconstruction method 2's
+simplified curves.
