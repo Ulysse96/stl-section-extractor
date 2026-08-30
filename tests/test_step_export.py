@@ -1,0 +1,466 @@
+"""
+Smoke test for step_export.py. Needs OCP (OpenCASCADE), which only
+exists in the project's dedicated .venv312 -- see README. Under any
+other Python (including the one running the rest of this test suite)
+this whole module is skipped rather than failing.
+
+Deliberately does NOT import curve_utils (or anything that pulls in
+scipy/vtk): step_export.py itself only needs OCP + the standard
+library. On this project's original dev machine, Windows Smart App
+Control blocks several freshly pip-installed native packages inside
+.venv312 (vtk, scipy's compiled extensions) but not OCP -- importing
+curve_utils here would hit that wall for a reason that has nothing to
+do with what this test is meant to check.
+"""
+
+import numpy as np
+import pytest
+
+pytest.importorskip("OCP")
+
+from step_export import (
+    build_single_surface,
+    build_step_surfaces,
+    _surface_deviates_from_data,
+)
+
+# _synthetic_patch's curves are spaced 4 / (5 - 1) = 1.0 apart, both
+# directions -- standing in for section_stl.py's
+# width_a/(number_of_sections_a - 1).
+SECTION_SPACING_MM = 1.0
+
+
+def _dome_z(x, y):
+    return 0.3 * np.sin(x * 0.7) * np.cos(y * 0.5)
+
+
+def _synthetic_patch():
+    # A gently curved 4x4 patch: 5 A-direction curves, 5 B-direction
+    # curves, and a closed boundary loop around the perimeter --
+    # standing in for section_stl.py's rich_main_curves +
+    # boundary_loop_points on a real scan.
+    interior_curves = []
+
+    for x in np.linspace(0, 4, 5):
+        ys = np.linspace(0, 4, 30)
+        interior_curves.append(
+            np.column_stack([np.full_like(ys, x), ys, _dome_z(x, ys)])
+        )
+
+    for y in np.linspace(0, 4, 5):
+        xs = np.linspace(0, 4, 30)
+        interior_curves.append(
+            np.column_stack([xs, np.full_like(xs, y), _dome_z(xs, y)])
+        )
+
+    boundary = []
+    for x in np.linspace(0, 4, 15):
+        boundary.append([x, 0, _dome_z(x, 0)])
+    for y in np.linspace(0, 4, 15)[1:]:
+        boundary.append([4, y, _dome_z(4, y)])
+    for x in np.linspace(4, 0, 15)[1:]:
+        boundary.append([x, 4, _dome_z(x, 4)])
+    for y in np.linspace(4, 0, 15)[1:]:
+        boundary.append([0, y, _dome_z(0, y)])
+    boundary.append(boundary[0])
+
+    return np.array(boundary), interior_curves
+
+
+def test_build_single_surface_produces_one_valid_face():
+    boundary, interior_curves = _synthetic_patch()
+
+    face = build_single_surface(
+        boundary, interior_curves,
+        smoothing_tolerance_mm=0.3, max_section_spacing_mm=SECTION_SPACING_MM
+    )
+
+    assert face is not None
+
+
+def test_build_single_surface_closes_an_open_boundary_loop():
+    # Regression test: order_boundary_loop's output (what
+    # section_stl.py actually passes in) is NOT closed -- its own
+    # first point isn't repeated at the end. Feeding that straight
+    # into OpenCASCADE as a bounding wire built, but into a
+    # geometrically invalid face, confirmed directly against a real
+    # 44-point boundary loop from an 11x11 section grid.
+    # build_single_surface must close it itself.
+    _, interior_curves = _synthetic_patch()
+
+    open_boundary = np.array(
+        [[0, 0, 0], [4, 0, 0.1], [4, 4, 0], [0, 4, -0.1]], dtype=float
+    )
+    assert not np.allclose(open_boundary[0], open_boundary[-1])
+
+    face = build_single_surface(
+        open_boundary, interior_curves,
+        smoothing_tolerance_mm=0.3, max_section_spacing_mm=SECTION_SPACING_MM
+    )
+
+    assert face is not None
+
+
+def test_build_step_surfaces_writes_a_valid_step_file_with_one_face(tmp_path):
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
+    }
+
+    output_path = tmp_path / "surface.step"
+
+    build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+
+    content = output_path.read_text(encoding="utf-8", errors="ignore")
+
+    assert content.count("ADVANCED_FACE") == 1
+    assert "MILLI" in content and "METRE" in content
+
+
+def test_build_single_surface_smooths_a_sharp_local_fold():
+    # The core reason this project moved from a per-cell patchwork to
+    # one global surface: internal guide curves should be treated as
+    # SOFT constraints, so a sharp local fold gets smoothed away
+    # rather than reproduced -- confirmed by direct OCP probing
+    # before relying on it (see step_export.py's module docstring).
+    # This encodes that finding as a regression test: the fold's
+    # amplitude must survive at only a small fraction in the surface.
+    fold_center = 2.0
+    fold_amplitude = 0.8
+
+    def fold_bump(v):
+        if abs(v - fold_center) > 0.3:
+            return 0.0
+        return fold_amplitude * np.exp(-((v - fold_center) ** 2) / (2 * 0.1 ** 2))
+
+    interior_curves = []
+
+    for x in np.linspace(0, 4, 5):
+        ys = np.linspace(0, 4, 40)
+        z = _dome_z(x, ys)
+        if abs(x - fold_center) < 0.01:
+            z = z + np.array([fold_bump(y) for y in ys])
+        interior_curves.append(np.column_stack([np.full_like(ys, x), ys, z]))
+
+    for y in np.linspace(0, 4, 5):
+        xs = np.linspace(0, 4, 40)
+        z = _dome_z(xs, y)
+        if abs(y - fold_center) < 0.01:
+            z = z + np.array([fold_bump(x) for x in xs])
+        interior_curves.append(np.column_stack([xs, np.full_like(xs, y), z]))
+
+    boundary, _ = _synthetic_patch()
+
+    face = build_single_surface(
+        boundary, interior_curves,
+        smoothing_tolerance_mm=0.05, max_section_spacing_mm=SECTION_SPACING_MM
+    )
+
+    from OCP.gp import gp_Pnt
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.BRep import BRep_Tool
+
+    surf = BRep_Tool.Surface_s(face)
+    target = gp_Pnt(fold_center, fold_center, _dome_z(fold_center, fold_center))
+    projector = GeomAPI_ProjectPointOnSurf(target, surf)
+    nearest = projector.NearestPoint()
+
+    fold_retained = abs(nearest.Z() - _dome_z(fold_center, fold_center))
+
+    # Well under half the fold's own amplitude survives -- the sharp
+    # local feature is smoothed away, not reproduced.
+    assert fold_retained < fold_amplitude * 0.5
+
+
+def test_build_step_surfaces_retries_with_a_looser_tolerance(tmp_path, monkeypatch):
+    # A real, complex shape can be too much for a single low-degree
+    # surface to fit at the user's requested tolerance without
+    # folding over itself, even with a clean boundary loop -- a
+    # looser tolerance gives OpenCASCADE more room to find a valid
+    # fit. Rather than making the user manually re-run the whole
+    # pipeline with a bigger number, build_step_surfaces retries a
+    # few times with a progressively looser tolerance itself. Mocks
+    # build_single_surface directly (real geometry that reliably
+    # fails at one tolerance and succeeds at another isn't practical
+    # to construct synthetically) to check the retry control flow
+    # itself: fails twice, succeeds on the third, real attempt.
+    import step_export
+
+    calls = []
+
+    real_build_single_surface = step_export.build_single_surface
+
+    def flaky_build_single_surface(boundary, interior, tolerance, max_section_spacing_mm):
+        calls.append(tolerance)
+        if len(calls) < 3:
+            raise RuntimeError("simulated fill failure")
+        return real_build_single_surface(boundary, interior, tolerance, max_section_spacing_mm)
+
+    monkeypatch.setattr(
+        step_export, "build_single_surface", flaky_build_single_surface
+    )
+
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
+    }
+
+    output_path = tmp_path / "surface.step"
+
+    step_export.build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+    assert len(calls) == 3
+    # Each retry loosens by RETRY_TOLERANCE_FACTOR from the original.
+    assert calls[0] == pytest.approx(0.3)
+    assert calls[1] > calls[0]
+    assert calls[2] > calls[1]
+
+
+def _make_bezier_face(corners):
+    # A minimal (2x2 pole, degree-1) B-rep face with EXACTLY the
+    # given corner points as its control points -- lets these tests
+    # place a face's raw control points precisely, without going
+    # through the (expensive, and not fully controllable) filling
+    # algorithm.
+    from OCP.gp import gp_Pnt
+    from OCP.TColgp import TColgp_Array2OfPnt
+    from OCP.Geom import Geom_BezierSurface
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+
+    poles = TColgp_Array2OfPnt(1, 2, 1, 2)
+    for i in range(2):
+        for j in range(2):
+            x, y, z = corners[i][j]
+            poles.SetValue(i + 1, j + 1, gp_Pnt(float(x), float(y), float(z)))
+
+    surface = Geom_BezierSurface(poles)
+    return BRepBuilderAPI_MakeFace(surface, 1e-6).Face()
+
+
+def test_surface_deviates_from_data_accepts_a_surface_near_its_input():
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
+    )
+
+    near_face = _make_bezier_face(
+        [[[0, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0]]]
+    )
+
+    assert not _surface_deviates_from_data(
+        near_face, input_points, [input_points], max_section_spacing_mm=1.0
+    )
+
+
+def test_surface_deviates_from_data_rejects_a_surface_far_from_its_input():
+    # Regression test for the real failure this project hit: a
+    # topologically valid surface that locally strayed far from the
+    # actual scan data (see step_export.py's module-level comment on
+    # _surface_deviates_from_data / MAX_SURFACE_DEVIATION_FACTOR).
+    # Stands in for that with a face deliberately placed tens of
+    # thousands of units away from tiny input curves -- every point
+    # actually ON this face is nowhere near any real input point.
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0]], dtype=float
+    )
+
+    far_face = _make_bezier_face(
+        [[[20000, 20000, 0], [20000, 20001, 0]],
+         [[20001, 20000, 0], [20001, 20001, 0]]]
+    )
+
+    assert _surface_deviates_from_data(
+        far_face, input_points, [input_points], max_section_spacing_mm=1.0
+    )
+
+
+def test_surface_deviates_from_data_rejects_a_surface_missing_real_coverage():
+    # Regression test for the OTHER real failure this project hit,
+    # distinct from a local bulge/sag: a topologically valid surface
+    # that simply didn't extend far enough to cover part of the real
+    # scan data at all -- confirmed directly on a real hat fit whose
+    # real (trimmed) surface only spanned about half the scan's own Z
+    # range. Every point that DID exist on that surface was close to
+    # SOME data point, so a one-way "surface -> data" check missed it
+    # completely; only checking "every data point has nearby surface"
+    # catches a real gap like this. Stands in for that here with a
+    # small face that legitimately covers three of four input points,
+    # but leaves one far corner with no nearby surface at all.
+    input_points = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [1, 1, 0], [10, 10, 0]],
+        dtype=float,
+    )
+
+    small_face = _make_bezier_face(
+        [[[0, 0, 0], [0, 1, 0]], [[1, 0, 0], [1, 1, 0]]]
+    )
+
+    assert _surface_deviates_from_data(
+        small_face, input_points, [input_points], max_section_spacing_mm=1.0
+    )
+
+
+def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
+    import step_export
+
+    def always_fails(boundary, interior, tolerance, max_section_spacing_mm):
+        raise RuntimeError("simulated fill failure")
+
+    monkeypatch.setattr(step_export, "build_single_surface", always_fails)
+
+    boundary, interior_curves = _synthetic_patch()
+
+    data = {
+        "regions": [{
+            "boundary_loop": boundary,
+            "interior_curves": interior_curves,
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        }],
+    }
+
+    try:
+        step_export.build_step_surfaces(data, "unused.step")
+    except RuntimeError as exc:
+        assert "any region" in str(exc)
+    else:
+        raise AssertionError("expected a RuntimeError after exhausting retries")
+
+
+def _synthetic_two_region_patch():
+    # Two adjacent, individually-simple regions (rectangles [0,2]x
+    # [0,4] and [2,4]x[0,4] on the same dome) sharing a straight seam
+    # at x=2, built from the SAME sample points on both sides so the
+    # seam coincides -- stands in for what curve_utils.split_boundary_
+    # and_curves_at_separator hands to step_export.py once a scan is
+    # split into panels. Built directly here (not via curve_utils,
+    # which this test file avoids importing -- see the module
+    # docstring) since only step_export.py's own handling of a
+    # "regions" list needs checking, not the splitting logic itself
+    # (covered in tests/test_curve_utils.py).
+    seam = np.array(
+        [[2.0, y, _dome_z(2.0, y)] for y in np.linspace(0, 4, 15)]
+    )
+
+    def edge_x(x_from, x_to, y, n=8):
+        return [[x, y, _dome_z(x, y)] for x in np.linspace(x_from, x_to, n)]
+
+    def edge_y(x, y_from, y_to, n=8):
+        return [[x, y, _dome_z(x, y)] for y in np.linspace(y_from, y_to, n)]
+
+    def interior_curves(x_min, x_max):
+        curves = []
+        for x in np.linspace(x_min, x_max, 3):
+            ys = np.linspace(0, 4, 20)
+            curves.append(
+                np.column_stack([np.full_like(ys, x), ys, _dome_z(x, ys)])
+            )
+        return curves
+
+    region_1_boundary = np.array(
+        edge_x(0, 2, 0) + seam.tolist() + edge_x(2, 0, 4) + edge_y(0, 4, 0)
+    )
+    region_2_boundary = np.array(
+        edge_x(2, 4, 0) + edge_y(4, 0, 4) + edge_x(4, 2, 4)
+        + seam[::-1].tolist()
+    )
+
+    return [
+        {
+            "boundary_loop": region_1_boundary,
+            "interior_curves": interior_curves(0, 2),
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        },
+        {
+            "boundary_loop": region_2_boundary,
+            "interior_curves": interior_curves(2, 4),
+            "smoothing_tolerance_mm": 0.3,
+            "max_section_spacing_mm": SECTION_SPACING_MM,
+        },
+    ]
+
+
+def test_build_step_surfaces_sews_multiple_regions_into_one_shape(tmp_path):
+    data = {"regions": _synthetic_two_region_patch()}
+
+    output_path = tmp_path / "surface.step"
+
+    build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+
+    content = output_path.read_text(encoding="utf-8", errors="ignore")
+
+    # build_step_surfaces already raises if BRepCheck_Analyzer finds
+    # the sewn shape invalid -- reaching this point at all means the
+    # two regions' faces sewed into one valid shape sharing their
+    # seam, not just two independent faces that happen to touch.
+    assert content.count("ADVANCED_FACE") == 2
+
+
+def test_build_step_surfaces_skips_a_region_that_cannot_be_built(tmp_path, monkeypatch):
+    # Regression test for a real failure this project hit: tracing a
+    # seam too close to an existing panel edge can carve off a thin,
+    # hard-to-fit sliver -- on a real scan, 2 of 3 regions built fine
+    # but the 3rd failed at every retried tolerance, and the whole
+    # export aborted with NOTHING written even though 2 perfectly
+    # good surfaces existed. A region that can't be built should be
+    # skipped (with a warning), not take down the other regions too.
+    import step_export
+
+    real_build_single_surface = step_export.build_single_surface
+
+    # max_section_spacing_mm=999.0 marks the one region meant to fail
+    # -- lets the other two go through the real fill unmocked.
+    def build_single_surface_one_region_always_fails(
+        boundary, interior, tolerance, max_section_spacing_mm
+    ):
+        if max_section_spacing_mm == 999.0:
+            raise RuntimeError("simulated: unbuildable sliver")
+        return real_build_single_surface(
+            boundary, interior, tolerance, max_section_spacing_mm
+        )
+
+    monkeypatch.setattr(
+        step_export,
+        "build_single_surface",
+        build_single_surface_one_region_always_fails,
+    )
+
+    regions = _synthetic_two_region_patch()
+
+    unbuildable_boundary, _ = _synthetic_patch()
+    regions.append({
+        "boundary_loop": unbuildable_boundary,
+        "interior_curves": [],
+        "smoothing_tolerance_mm": 0.3,
+        "max_section_spacing_mm": 999.0,
+    })
+
+    data = {"regions": regions}
+
+    output_path = tmp_path / "surface.step"
+
+    step_export.build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+
+    content = output_path.read_text(encoding="utf-8", errors="ignore")
+
+    # Only the 2 buildable regions made it into the file.
+    assert content.count("ADVANCED_FACE") == 2

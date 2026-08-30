@@ -5,6 +5,8 @@ import pyvista as pv
 import vtk
 import ezdxf
 import os
+import pickle
+import subprocess
 
 from curve_utils import (
     UNIT_TO_MM,
@@ -15,6 +17,9 @@ from curve_utils import (
     reconstruct_curve_piecewise,
     find_curve_crossings,
     build_simple_spline_curve,
+    collect_curve_endpoints,
+    order_boundary_loop,
+    split_into_panels,
 )
 
 
@@ -667,6 +672,35 @@ def ask_all_parameters(with_plane_b):
 
         row[0] += 1
 
+        add_title("Surface reconstruction (STEP export)")
+
+        add_help(
+            "How far (mm) the single reconstructed surface may "
+            "deviate from the scanned curves. Every A/B curve is "
+            "used as a soft guide, not a hard constraint, so this "
+            "mainly controls how aggressively small local folds/ "
+            "wrinkles are smoothed away while the overall shape is "
+            "still followed. Larger = smoother (good before "
+            "flattening the surface e.g. in Wrapstyler); smaller = "
+            "closer to the raw scan. Try 2-5 mm as a starting point."
+        )
+
+        surface_smoothing_var = add_field(
+            "Smoothing tolerance (mm):", 2.0
+        )
+
+        add_help(
+            "Sections to leave out of the reconstructed surface are "
+            "chosen later, by clicking on them directly once every "
+            "curve is visible (a real hole/gap in the object, e.g. "
+            "a strap adjustment slot, otherwise drags the boundary "
+            "loop and the surface into a bad shape right there)."
+        )
+
+    else:
+
+        surface_smoothing_var = None
+
     def on_submit():
 
         try:
@@ -734,6 +768,21 @@ def ask_all_parameters(with_plane_b):
                 method_var.get() if with_plane_b else 1
             )
 
+            if with_plane_b:
+
+                result["surface_smoothing_mm"] = float(
+                    surface_smoothing_var.get()
+                )
+
+                if result["surface_smoothing_mm"] <= 0:
+                    raise ValueError(
+                        "Surface smoothing tolerance must be > 0."
+                    )
+
+            else:
+
+                result["surface_smoothing_mm"] = None
+
         except ValueError as exc:
 
             messagebox.showerror("Invalid input", str(exc))
@@ -780,6 +829,7 @@ ideal_curve_strength = parameters["ideal_curve_strength"]
 max_polynomial_degree = parameters["max_polynomial_degree"]
 r2_target = parameters["r2_target"]
 reconstruction_method = parameters["reconstruction_method"]
+surface_smoothing_mm = parameters["surface_smoothing_mm"]
 
 
 print()
@@ -832,6 +882,10 @@ if use_plane_b:
     print(
         f"Reconstruction method: {reconstruction_method} "
         f"({method_name})"
+    )
+
+    print(
+        f"Surface smoothing tolerance: {surface_smoothing_mm:.2f} mm"
     )
 
 
@@ -1569,9 +1623,429 @@ if use_plane_b:
 
 all_section_data = all_section_data_a + all_section_data_b
 
+# Snapshot every main curve's full-resolution shape right here,
+# before either reconstruction method can touch it. Method 2 (see
+# step 11bis below) replaces curve_info["points_3d"] with a minimal
+# "start + intersections + end" polyline so that curve A_i and
+# curve B_j meet at an exact shared point -- but that also throws
+# away the actual scanned shape BETWEEN those intersections. Surface
+# reconstruction (step 14) needs the real, richly-sampled curve for
+# its cell edges -- using the post-rebuild version produced flat,
+# near-planar cells instead of surfaces following the scan -- so it
+# is given this snapshot instead of all_section_data's own (possibly
+# later-simplified) points_3d.
+rich_main_curves = {}
+
+for data in all_section_data:
+
+    main_index = data["main_curve_index"]
+
+    if main_index is not None:
+
+        rich_main_curves[(data["direction"], data["number"])] = np.array(
+            data["curves"][main_index]["points_3d"],
+            dtype=float
+        )
+
+# The scanned patch's outline: a closed loop through the ordered
+# open endpoints of every A/B curve, built from the same
+# full-resolution snapshot above rather than a possibly-simplified
+# curve. Computed once here so it can be included both in
+# sections_main_3d.dxf (step 13.3) and its own boundary_loop.dxf
+# (step 13.5), and reused by surface reconstruction later.
+boundary_loop_points = (
+    order_boundary_loop(collect_curve_endpoints(rich_main_curves))
+    if len(rich_main_curves) >= 3
+    else None
+)
+
+# --------------------------------------------------------
+# 12bis. EXCLUDE SECTIONS FROM THE RECONSTRUCTED SURFACE
+#        (optional, click-based)
+# --------------------------------------------------------
+#
+# A real hole/gap in the object (a strap adjustment slot, a vent)
+# isn't scan noise, but it does break the "one simple closed
+# boundary" assumption the surface step relies on -- the boundary
+# loop and the surface itself can both get dragged into a bad shape
+# right at that hole. Which section(s) cross it can only really be
+# told apart by SEEING them (a section number alone means nothing
+# without the picture), so this is a click window, not a typed list.
+# Excluded sections stay in every DXF export as usual (see
+# rich_main_curves/boundary_loop_points above); only this separate
+# surface_main_curves view, used for surface reconstruction below,
+# leaves them out.
+
+excluded_from_surface = set()
+
+if use_plane_b and len(rich_main_curves) >= 3:
+
+    print()
+    print("======================================")
+    print("EXCLUDE SECTIONS FROM SURFACE (optional)")
+    print("======================================")
+
+    print(
+        "Click a curve to exclude it from the reconstructed surface\n"
+        "-- e.g. one crossing a real hole/gap in the object, like a\n"
+        "strap adjustment slot, rather than scan noise. Click again\n"
+        "to re-include it. Excluded curves turn dim/thin; every DXF\n"
+        "export still includes them as usual. Close the window when\n"
+        "done (no clicks = use every section)."
+    )
+
+    exclude_colors = [
+        "red", "blue", "green", "orange", "purple",
+        "cyan", "magenta", "brown"
+    ]
+
+    exclude_plotter = pv.Plotter(
+        window_size=(1500, 950)
+    )
+
+    exclude_plotter.add_mesh(
+        mesh,
+        color="lightgray",
+        opacity=0.12,
+        show_edges=False
+    )
+
+    exclude_plotter.add_text(
+        "EXCLUDE SECTIONS - click a curve to leave it out of the "
+        "surface (optional)",
+        position="upper_left",
+        font_size=16
+    )
+
+    exclude_actor_map = {}
+
+    for curve_index, key in enumerate(sorted(rich_main_curves.keys())):
+
+        points = rich_main_curves[key]
+
+        if len(points) < 2:
+            continue
+
+        color = exclude_colors[curve_index % len(exclude_colors)]
+
+        line = pv.lines_from_points(
+            points,
+            close=False
+        )
+
+        actor = exclude_plotter.add_mesh(
+            line,
+            color=color,
+            line_width=4,
+            name=f"exclude_curve_{key[0]}{key[1]}"
+        )
+
+        exclude_actor_map[actor] = {
+            "key": key,
+            "default_color": color
+        }
+
+        exclude_plotter.add_point_labels(
+            np.array([points[len(points) // 2]]),
+            [f"{key[0]}{key[1]}"],
+            point_size=1,
+            font_size=14,
+            shape=None,
+            name=f"exclude_label_{key[0]}{key[1]}"
+        )
+
+    exclude_picker = vtk.vtkCellPicker()
+    exclude_picker.SetTolerance(0.005)
+    exclude_picker.PickFromListOn()
+
+    for actor in exclude_actor_map:
+        exclude_picker.AddPickList(actor)
+
+    def exclude_click(caller, event):
+
+        x, y = caller.GetEventPosition()
+
+        exclude_picker.Pick(
+            x,
+            y,
+            0,
+            exclude_plotter.renderer
+        )
+
+        actor = exclude_picker.GetActor()
+
+        if actor is None or actor not in exclude_actor_map:
+            return
+
+        info = exclude_actor_map[actor]
+        key = info["key"]
+
+        if key in excluded_from_surface:
+
+            excluded_from_surface.discard(key)
+
+            actor.prop.color = info["default_color"]
+            actor.prop.line_width = 4
+            actor.prop.opacity = 1.0
+
+            print(f"  {key[0]}{key[1]}: re-included")
+
+        else:
+
+            excluded_from_surface.add(key)
+
+            actor.prop.color = "black"
+            actor.prop.line_width = 1
+            actor.prop.opacity = 0.3
+
+            print(f"  {key[0]}{key[1]}: excluded")
+
+        exclude_plotter.render()
+
+    exclude_plotter.iren.add_observer(
+        "LeftButtonPressEvent",
+        exclude_click
+    )
+
+    exclude_plotter.add_axes()
+
+    exclude_plotter.show()
+
+    if excluded_from_surface:
+
+        print(
+            "  Excluded from surface: "
+            + ", ".join(
+                f"{d}{n}" for d, n in sorted(excluded_from_surface)
+            )
+        )
+
+    else:
+
+        print("  No sections excluded.")
+
+
+# A separate view of the curve set with the excluded sections left
+# out, used ONLY for surface reconstruction below. The DXF exports
+# above (including boundary_loop.dxf) still use the full, unfiltered
+# rich_main_curves, so excluded sections stay visible there for
+# reference/diagnosis.
+surface_main_curves = {
+    key: points
+    for key, points in rich_main_curves.items()
+    if key not in excluded_from_surface
+}
+
+surface_boundary_loop_points = (
+    order_boundary_loop(collect_curve_endpoints(surface_main_curves))
+    if len(surface_main_curves) >= 3
+    else None
+)
+
 
 # ============================================================
-# 12ter. FIND A x B INTERSECTIONS ON THE FINAL CURVES
+# 12ter. SEPARATE INTO PANELS (optional)
+# ============================================================
+#
+# A single global surface asks one B-spline to reconcile every
+# region's curvature at once -- confirmed as the direct cause of a
+# real SolidWorks import failure ("no geometry data"): the fitted
+# surface's own boundary edge ended up 14-33mm off from the requested
+# boundary loop, regardless of smoothing tolerance, because a single
+# degree-8 fit couldn't reconcile a cap's near-flat visor and domed
+# crown at once (BRep_Tool.Tolerance_s on the built edge, confirmed
+# directly -- and neither ShapeFix_Shape nor BRepLib.SameParameter_s
+# could shrink it, since the gap is a real geometric fact, not a
+# stale tolerance flag). Tracing a seam here (e.g. where the visor
+# meets the crown) splits the patch into simpler, individually
+# better-behaved surfaces instead -- see
+# curve_utils.split_into_panels. Any number of seams can be traced,
+# each further subdividing whichever ONE panel (of everything split
+# off so far) its own two ends land within -- see the README.
+
+separator_lines = []
+current_separator_line = []
+
+if use_plane_b and surface_boundary_loop_points is not None:
+
+    print()
+    print("======================================")
+    print("SEPARATE INTO PANELS (optional)")
+    print("======================================")
+
+    print(
+        "Click a sequence of points along a seam on the mesh (e.g.\n"
+        "where a cap's visor meets its crown), both ends near the\n"
+        "outer edge, to reconstruct that region as its own simpler\n"
+        "surface instead of one surface for everything. Press 'n' to\n"
+        "finish the current seam and start another one -- each seam\n"
+        "must stay within a single existing panel (trace the\n"
+        "crown/visor seam first; a seam splitting off another panel\n"
+        "has to be traced within one of the results, not across two\n"
+        "already-split panels). Close the window when done (no\n"
+        "clicks, or just one point, = one single surface, as usual)."
+    )
+
+    separator_plotter = pv.Plotter(
+        window_size=(1500, 950)
+    )
+
+    separator_plotter.add_mesh(
+        mesh,
+        color="lightgray",
+        opacity=0.5
+    )
+
+    separator_plotter.add_text(
+        "SEPARATE INTO PANELS - click points along a seam, both ends "
+        "near the outer edge. Press 'n' for another seam (optional)",
+        position="upper_left",
+        font_size=16
+    )
+
+    separator_colors = [
+        "yellow", "cyan", "magenta", "orange", "lime", "red"
+    ]
+
+    separator_picker = vtk.vtkCellPicker()
+    separator_picker.SetTolerance(0.001)
+
+    def separator_click(caller, event):
+
+        x, y = caller.GetEventPosition()
+
+        separator_picker.Pick(
+            x,
+            y,
+            0,
+            separator_plotter.renderer
+        )
+
+        if separator_picker.GetCellId() < 0:
+            print("No surface detected.")
+            return
+
+        point = np.array(
+            separator_picker.GetPickPosition()
+        )
+
+        current_separator_line.append(point)
+
+        print(
+            f"  Seam {len(separator_lines) + 1}, point "
+            f"{len(current_separator_line)}: X={point[0]:.4f}, "
+            f"Y={point[1]:.4f}, Z={point[2]:.4f}"
+        )
+
+        color = separator_colors[
+            len(separator_lines) % len(separator_colors)
+        ]
+
+        if len(current_separator_line) >= 2:
+
+            line = pv.lines_from_points(
+                np.array(current_separator_line),
+                close=False
+            )
+
+            separator_plotter.add_mesh(
+                line,
+                color=color,
+                line_width=5,
+                name=f"separator_line_{len(separator_lines)}"
+            )
+
+        marker = pv.PolyData(
+            point.reshape(1, 3)
+        )
+
+        separator_plotter.add_mesh(
+            marker,
+            color=color,
+            point_size=14,
+            render_points_as_spheres=True,
+            name=(
+                f"separator_point_{len(separator_lines)}_"
+                f"{len(current_separator_line)}"
+            )
+        )
+
+        separator_plotter.render()
+
+    def separator_next_line():
+
+        if len(current_separator_line) >= 2:
+
+            separator_lines.append(list(current_separator_line))
+
+            print(
+                f"  Seam {len(separator_lines)} finished "
+                f"({len(current_separator_line)} points)."
+            )
+
+            current_separator_line.clear()
+
+        else:
+
+            print(
+                "  Need at least 2 points before starting another "
+                "seam -- ignored."
+            )
+
+    separator_plotter.iren.add_observer(
+        "LeftButtonPressEvent",
+        separator_click
+    )
+
+    separator_plotter.add_key_event("n", separator_next_line)
+
+    separator_plotter.add_axes()
+
+    separator_plotter.show()
+
+    if len(current_separator_line) >= 2:
+
+        separator_lines.append(list(current_separator_line))
+
+        print(
+            f"  Seam {len(separator_lines)} finished "
+            f"({len(current_separator_line)} points)."
+        )
+
+    if separator_lines:
+        print(f"  {len(separator_lines)} seam(s) traced.")
+    else:
+        print("  No seam traced -- using one single surface.")
+
+if surface_boundary_loop_points is None:
+
+    surface_regions = []
+
+elif separator_lines:
+
+    surface_regions, skipped_seams = split_into_panels(
+        surface_boundary_loop_points,
+        surface_main_curves,
+        [np.array(line) for line in separator_lines]
+    )
+
+    for seam_index, reason in skipped_seams:
+
+        print(
+            f"  Seam {seam_index + 1} could not be applied and was "
+            f"skipped -- {reason}"
+        )
+
+else:
+
+    surface_regions = [{
+        "boundary_loop": surface_boundary_loop_points,
+        "interior_curves": list(surface_main_curves.values())
+    }]
+
+
+# ============================================================
+# 12quater. FIND A x B INTERSECTIONS ON THE FINAL CURVES
 # ============================================================
 #
 # Curves have now been smoothed and (optionally) reconstructed
@@ -1601,7 +2075,12 @@ def find_all_intersections(all_section_data, plane_intersections):
     many distinct closest-approach locations between the CURRENT
     curve A_i and curve B_j (whatever state they are in when this
     is called). Returns a list of
-    {"pair_id": (i, j, k), "point": ..., "gap": ...}.
+    {"pair_id": (i, j, k), "point": ..., "gap": ...,
+    "idx_a": ..., "idx_b": ...} where idx_a/idx_b are the point
+    indices, along curve A_i's and B_j's own points_3d array,
+    where the crossing sits -- used downstream to cut each curve
+    into segments at its crossings for surface reconstruction
+    (see curve_utils.segment_curve_at_indices).
     Does not modify any curve.
     """
 
@@ -1671,7 +2150,9 @@ def find_all_intersections(all_section_data, plane_intersections):
                 {
                     "pair_id": (i, j, k),
                     "point": reference_point,
-                    "gap": gap
+                    "gap": gap,
+                    "idx_a": int(idx_a),
+                    "idx_b": int(idx_b)
                 }
             )
 
@@ -2396,6 +2877,19 @@ for data in all_section_data:
 
     msp3d.add_spline(fit_points=points)
 
+if boundary_loop_points is not None:
+
+    closed_boundary_points = np.vstack(
+        [boundary_loop_points, boundary_loop_points[0:1]]
+    )
+
+    msp3d.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_boundary_points
+        ]
+    )
+
 doc3d.saveas(dxf_path_3d)
 
 print(dxf_path_3d)
@@ -2444,8 +2938,222 @@ if use_plane_b and found_intersections:
     print(dxf_path_intersections)
 
 
+# --------------------------------------------------------
+# 13.5 boundary_loop : la meme spline fermee deja added a
+#      sections_main_3d.dxf (step 13.3), aussi ecrite dans son
+#      propre fichier pour qu'elle soit facile a isoler/reutiliser
+#      seule (ex: fermer la coque en step 14).
+# --------------------------------------------------------
+
+if boundary_loop_points is not None:
+
+    print()
+    print("--- boundary_loop ---")
+
+    boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop.dxf"
+    )
+
+    doc_boundary = new_dxf_document()
+    msp_boundary = doc_boundary.modelspace()
+
+    closed_boundary_points = np.vstack(
+        [boundary_loop_points, boundary_loop_points[0:1]]
+    )
+
+    msp_boundary.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_boundary_points
+        ]
+    )
+
+    doc_boundary.saveas(boundary_path)
+
+    print(boundary_path)
+
+if surface_boundary_loop_points is not None and excluded_from_surface:
+
+    # A second copy reflecting the exclusions from step 12bis --
+    # what the STEP export in step 14 actually builds the surface
+    # from. Lets the boundary be checked visually (e.g. still
+    # jagged somewhere? try excluding another section) without
+    # having to run the STEP export itself each time. Only written
+    # when something was actually excluded; otherwise it would be
+    # identical to boundary_loop.dxf above.
+
+    print()
+    print("--- boundary_loop_surface ---")
+
+    surface_boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop_surface.dxf"
+    )
+
+    doc_surface_boundary = new_dxf_document()
+    msp_surface_boundary = doc_surface_boundary.modelspace()
+
+    closed_surface_boundary_points = np.vstack(
+        [surface_boundary_loop_points, surface_boundary_loop_points[0:1]]
+    )
+
+    msp_surface_boundary.add_spline(
+        fit_points=[
+            (float(p[0]), float(p[1]), float(p[2]))
+            for p in closed_surface_boundary_points
+        ]
+    )
+
+    doc_surface_boundary.saveas(surface_boundary_path)
+
+    print(surface_boundary_path)
+
+elif surface_boundary_loop_points is not None:
+
+    # No exclusions this run -- remove any boundary_loop_surface.dxf
+    # left over from an earlier run that DID exclude sections, so the
+    # output folder can't be mistaken for still reflecting exclusions
+    # that no longer apply (it would otherwise sit there looking
+    # identical to boundary_loop.dxf, since both now come from the
+    # same, unfiltered curve set).
+    stale_surface_boundary_path = os.path.join(
+        dir3d,
+        "boundary_loop_surface.dxf"
+    )
+
+    if os.path.isfile(stale_surface_boundary_path):
+        os.remove(stale_surface_boundary_path)
+
+
 # ============================================================
-# 14. DONE
+# 14. SURFACE RECONSTRUCTION (STEP EXPORT)
+# ============================================================
+#
+# Builds a continuous surface through the boundary loop and every
+# A/B section curve (curve_utils.order_boundary_loop /
+# rich_main_curves), exported as STEP -- a finished surface model
+# without going through SolidWorks. Needs plane B: a single-direction
+# cut (3 points) has no perpendicular curve family, and no closed
+# boundary loop to build from. Runs as a SEPARATE PROCESS in the
+# dedicated .venv312 (see README): the OpenCASCADE bindings this
+# needs have no Windows wheels for this script's own Python version,
+# so they can't be imported into this process directly.
+#
+# One surface per region in surface_regions (step 12ter above) -- by
+# default that's the whole patch as a single region (unchanged
+# behaviour), or two simpler, individually better-behaved surfaces if
+# a separator was traced, sewn together into one shape here.
+#
+# This used to be a per-grid-cell patchwork (one small Coons-style
+# patch per A x B cell, sewn into a shell). On a real scan that came
+# out visibly faceted, with occasional wild "spike" patches, and
+# faces SolidWorks kept flagging as invalid on import even after this
+# project's own checks passed them. A single surface, with every
+# curve as a SOFT guide rather than a hard per-cell boundary, avoids
+# all of that by construction -- see step_export.py for the direct
+# OCP probing behind that choice, including confirmation that a
+# sharp local fold only survives at a few percent of its amplitude,
+# which is what this project's actual goal (flattening the result in
+# Wrapstyler) wants: overall shape over local wrinkle fidelity.
+
+if use_plane_b and surface_regions:
+
+    print()
+    print("======================================")
+    print("SURFACE RECONSTRUCTION (STEP EXPORT)")
+    print("======================================")
+
+    venv_python = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        ".venv312",
+        "Scripts",
+        "python.exe"
+    )
+
+    step_export_script = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "step_export.py"
+    )
+
+    if not os.path.isfile(venv_python):
+
+        print(
+            "  Skipped: the dedicated Python 3.12 environment "
+            "(.venv312) was not found. See README.md, section "
+            "'Surface reconstruction (STEP export)', to set it up."
+        )
+
+    else:
+
+        # The LARGER of the two real distances between adjacent
+        # parallel cutting planes -- the data's natural local length
+        # scale, used by step_export.py to sanity-check how far the
+        # fitted surface strays from the real input data at any one
+        # point (see step_export.py's module docstring).
+        max_section_spacing_mm = max(
+            width_a / max(number_of_sections_a - 1, 1),
+            width_b / max(number_of_sections_b - 1, 1)
+        )
+
+        surface_data = {
+            "regions": [
+                {
+                    **region,
+                    "smoothing_tolerance_mm": surface_smoothing_mm,
+                    "max_section_spacing_mm": max_section_spacing_mm
+                }
+                for region in surface_regions
+            ]
+        }
+
+        data_pickle_path = os.path.join(
+            output_dir,
+            "surface_curves.pickle"
+        )
+
+        with open(data_pickle_path, "wb") as f:
+            pickle.dump(surface_data, f)
+
+        step_path = os.path.join(
+            output_dir,
+            "reconstructed_surface.step"
+        )
+
+        result = subprocess.run(
+            [
+                venv_python,
+                step_export_script,
+                data_pickle_path,
+                step_path
+            ],
+            capture_output=True,
+            text=True
+        )
+
+        if result.stdout:
+            print(result.stdout)
+
+        if result.returncode != 0:
+
+            print("  STEP export failed:")
+            print(result.stderr)
+
+        else:
+
+            print(f"  {step_path}")
+
+else:
+
+    print()
+    print(
+        "Plane B not used - surface reconstruction / STEP export "
+        "skipped (needs the A x B curve grid and its boundary loop)."
+    )
+
+
+# ============================================================
+# 15. DONE
 # ============================================================
 
 print()
