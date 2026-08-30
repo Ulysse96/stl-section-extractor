@@ -232,6 +232,16 @@ empty over one bad seam. Retrace that specific seam (further from the
 existing boundary) and re-run if the skipped panel was actually
 needed.
 
+A seam whose two ends snap too close together along the boundary is
+rejected up front, the same way, rather than silently building a
+razor-thin sliver region: confirmed on a real scan with several seams
+traced close together, one boundary ended up with only 3 points, which
+still "passed" every downstream check (a boundary that small is easy
+to stay technically close to) while producing a badly twisted,
+physically nonsensical surface. One bad seam like this is skipped and
+reported on its own, too — it doesn't discard every OTHER seam that
+was traced correctly.
+
 **Only edge-to-edge seams are supported for now**: both ends of a seam
 must land on the outer boundary (of the panel being split). A seam
 fully enclosed inside a panel's outline (a button, a back tab — not

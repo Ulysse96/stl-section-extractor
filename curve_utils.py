@@ -961,6 +961,12 @@ def _side_of_polyline_2d(point, polyline):
     return best_side > 0
 
 
+# Each side of a seam needs at least this many of the boundary loop's
+# own points to still be a meaningful arc, not a razor-thin sliver --
+# see the comment where this is checked, below.
+MIN_ARC_BOUNDARY_POINTS = 4
+
+
 def split_boundary_and_curves_at_separator(
     boundary_loop_points, main_curves, separator_points
 ):
@@ -1020,6 +1026,24 @@ def split_boundary_and_curves_at_separator(
 
     arc_forward = arc(start_idx, end_idx)
     arc_backward = arc(end_idx, start_idx)
+
+    # A separator whose two ends snap close together along the
+    # boundary (not identical -- that's caught above -- but close
+    # enough that one of the two arcs is almost nothing) produces a
+    # razor-thin sliver region: confirmed directly as the cause of a
+    # real, badly twisted surface on a real scan, where a boundary of
+    # only 3 points still "successfully" passed the surface's own
+    # deviation check (few points, easy to stay technically close to)
+    # while being physically nonsensical. Reject it here instead,
+    # with a message pointing at the actual fix, rather than silently
+    # building garbage that only shows up as a bad surface far later.
+    if min(len(arc_forward), len(arc_backward)) < MIN_ARC_BOUNDARY_POINTS:
+        raise ValueError(
+            "This seam's two ends snapped too close together along "
+            "the boundary, leaving almost no boundary on one side -- "
+            "trace it further from the existing edge (or from other "
+            "seams already traced nearby)."
+        )
 
     # Each region's boundary is its own arc plus the separator,
     # traversed so it closes back onto the arc's own start -- the
@@ -1119,9 +1143,18 @@ def split_into_panels(boundary_loop_points, main_curves, separators):
     supported -- trace it within a single existing panel instead).
 
     `separators` is a list of (M, 3) point arrays, one per traced
-    seam, applied in order. Returns a list of panel dicts (same shape
-    as split_boundary_and_curves_at_separator's own return value) --
-    a single panel covering the whole patch if `separators` is empty.
+    seam, applied in order. Returns `(regions, skipped)`: `regions` is
+    a list of panel dicts (same shape as split_boundary_and_curves_
+    at_separator's own return value) -- a single panel covering the
+    whole patch if `separators` is empty (or none of them could be
+    applied). `skipped` is a list of `(index, reason)` for any
+    separator (its position in the input `separators` list) that
+    could NOT be applied -- its own two ends landing on different
+    existing panels, or split_boundary_and_curves_at_separator itself
+    rejecting it (e.g. too close to an existing edge). One bad seam
+    doesn't discard every OTHER seam that worked fine: it's just
+    skipped, same reasoning as step_export.py skipping one region
+    that can't be built rather than aborting the whole export.
     """
 
     regions = [{
@@ -1142,7 +1175,9 @@ def split_into_panels(boundary_loop_points, main_curves, separators):
 
         return int(np.argmin(distances))
 
-    for separator_points in separators:
+    skipped = []
+
+    for separator_index, separator_points in enumerate(separators):
 
         separator_points = np.asarray(separator_points, dtype=float)
 
@@ -1150,12 +1185,14 @@ def split_into_panels(boundary_loop_points, main_curves, separators):
         end_region = nearest_region_index(separator_points[-1])
 
         if start_region != end_region:
-            raise ValueError(
-                "This separator's two ends landed on different "
-                "existing panels -- trace each separator within a "
-                "single panel (one already-split-off region), not "
-                "across panels that were already split apart."
-            )
+            skipped.append((
+                separator_index,
+                "its two ends landed on different existing panels -- "
+                "trace it within a single panel (one already-split-"
+                "off region), not across panels that were already "
+                "split apart."
+            ))
+            continue
 
         target = regions[start_region]
 
@@ -1164,10 +1201,14 @@ def split_into_panels(boundary_loop_points, main_curves, separators):
             for i, points in enumerate(target["interior_curves"])
         }
 
-        split_result = split_boundary_and_curves_at_separator(
-            target["boundary_loop"], target_curves, separator_points
-        )
+        try:
+            split_result = split_boundary_and_curves_at_separator(
+                target["boundary_loop"], target_curves, separator_points
+            )
+        except ValueError as exc:
+            skipped.append((separator_index, str(exc)))
+            continue
 
         regions[start_region:start_region + 1] = split_result
 
-    return regions
+    return regions, skipped

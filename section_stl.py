@@ -2023,23 +2023,18 @@ if surface_boundary_loop_points is None:
 
 elif separator_lines:
 
-    try:
+    surface_regions, skipped_seams = split_into_panels(
+        surface_boundary_loop_points,
+        surface_main_curves,
+        [np.array(line) for line in separator_lines]
+    )
 
-        surface_regions = split_into_panels(
-            surface_boundary_loop_points,
-            surface_main_curves,
-            [np.array(line) for line in separator_lines]
+    for seam_index, reason in skipped_seams:
+
+        print(
+            f"  Seam {seam_index + 1} could not be applied and was "
+            f"skipped -- {reason}"
         )
-
-    except ValueError as exc:
-
-        print(f"  Could not split into panels ({exc}); using one "
-              "single surface instead.")
-
-        surface_regions = [{
-            "boundary_loop": surface_boundary_loop_points,
-            "interior_curves": list(surface_main_curves.values())
-        }]
 
 else:
 

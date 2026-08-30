@@ -546,10 +546,11 @@ def test_split_into_panels_with_no_separators_returns_one_panel():
         0: np.array([[3, 0, 0], [3, 2, 0], [3, 4, 0]], dtype=float),
     }
 
-    panels = split_into_panels(boundary, main_curves, [])
+    panels, skipped = split_into_panels(boundary, main_curves, [])
 
     assert len(panels) == 1
     assert len(panels[0]["interior_curves"]) == 1
+    assert skipped == []
 
 
 def test_split_into_panels_applies_two_independent_separators():
@@ -568,11 +569,12 @@ def test_split_into_panels_applies_two_independent_separators():
         "right": np.array([[5, 0, 0], [5, 2, 0], [5, 4, 0]], dtype=float),
     }
 
-    panels = split_into_panels(
+    panels, skipped = split_into_panels(
         boundary, main_curves, [separator_1, separator_2]
     )
 
     assert len(panels) == 3
+    assert skipped == []
 
     # Each panel got exactly its own strip's curve, whole.
     x_means = sorted(
@@ -584,7 +586,12 @@ def test_split_into_panels_applies_two_independent_separators():
         assert len(panel["interior_curves"]) == 1
 
 
-def test_split_into_panels_rejects_a_separator_crossing_two_panels():
+def test_split_into_panels_skips_a_separator_crossing_two_panels():
+    # One bad seam shouldn't discard every OTHER seam that worked --
+    # it's skipped (and reported), not a hard failure for the whole
+    # call. Regression test for a real case: the previous "raise on
+    # the first bad seam" behaviour discarded ALL seams, including
+    # ones that had split off perfectly good panels already.
     boundary = _rectangle_boundary_loop(6, 4)
 
     # First separator splits the rectangle at x=2 into two panels.
@@ -595,6 +602,40 @@ def test_split_into_panels_rejects_a_separator_crossing_two_panels():
     # panels rather than staying within one.
     separator_2 = np.array([[1, 0, 0], [3, 2, 0], [5, 4, 0]], dtype=float)
 
-    with pytest.raises(ValueError):
-        split_into_panels(boundary, {}, [separator_1, separator_2])
+    panels, skipped = split_into_panels(
+        boundary, {}, [separator_1, separator_2]
+    )
+
+    # The first (valid) separator still split the rectangle into 2.
+    assert len(panels) == 2
+
+    # The second (invalid) separator was skipped, at its own index,
+    # with a reason -- not silently dropped, and not raised.
+    assert len(skipped) == 1
+    assert skipped[0][0] == 1
+    assert "different existing panels" in skipped[0][1]
+
+
+def test_split_into_panels_skips_a_seam_that_leaves_a_sliver():
+    # Regression test for a real, more severe failure: several seams
+    # traced close together left one boundary with only 3 points --
+    # a razor-thin sliver that still "passed" downstream checks (few
+    # points, easy to stay technically close to) while producing a
+    # badly twisted, physically nonsensical surface. Rejected at the
+    # source now (split_boundary_and_curves_at_separator's own
+    # MIN_ARC_BOUNDARY_POINTS check) and reported as skipped here,
+    # rather than silently handed off to be fit into garbage.
+    boundary = _rectangle_boundary_loop(6, 4)
+
+    # Snaps to two adjacent boundary points near the corner (0, 0)
+    # and (0.5, 0) -- one side of the split arc is almost nothing.
+    sliver_separator = np.array(
+        [[0, 0, 0], [0.2, 1, 0], [0.5, 0, 0]], dtype=float
+    )
+
+    panels, skipped = split_into_panels(boundary, {}, [sliver_separator])
+
+    assert len(panels) == 1
+    assert len(skipped) == 1
+    assert skipped[0][0] == 0
 
