@@ -336,7 +336,7 @@ def test_build_step_surfaces_gives_up_after_max_retries(monkeypatch):
     try:
         step_export.build_step_surfaces(data, "unused.step")
     except RuntimeError as exc:
-        assert "retries" in str(exc)
+        assert "any region" in str(exc)
     else:
         raise AssertionError("expected a RuntimeError after exhausting retries")
 
@@ -410,4 +410,57 @@ def test_build_step_surfaces_sews_multiple_regions_into_one_shape(tmp_path):
     # the sewn shape invalid -- reaching this point at all means the
     # two regions' faces sewed into one valid shape sharing their
     # seam, not just two independent faces that happen to touch.
+    assert content.count("ADVANCED_FACE") == 2
+
+
+def test_build_step_surfaces_skips_a_region_that_cannot_be_built(tmp_path, monkeypatch):
+    # Regression test for a real failure this project hit: tracing a
+    # seam too close to an existing panel edge can carve off a thin,
+    # hard-to-fit sliver -- on a real scan, 2 of 3 regions built fine
+    # but the 3rd failed at every retried tolerance, and the whole
+    # export aborted with NOTHING written even though 2 perfectly
+    # good surfaces existed. A region that can't be built should be
+    # skipped (with a warning), not take down the other regions too.
+    import step_export
+
+    real_build_single_surface = step_export.build_single_surface
+
+    # max_section_spacing_mm=999.0 marks the one region meant to fail
+    # -- lets the other two go through the real fill unmocked.
+    def build_single_surface_one_region_always_fails(
+        boundary, interior, tolerance, max_section_spacing_mm
+    ):
+        if max_section_spacing_mm == 999.0:
+            raise RuntimeError("simulated: unbuildable sliver")
+        return real_build_single_surface(
+            boundary, interior, tolerance, max_section_spacing_mm
+        )
+
+    monkeypatch.setattr(
+        step_export,
+        "build_single_surface",
+        build_single_surface_one_region_always_fails,
+    )
+
+    regions = _synthetic_two_region_patch()
+
+    unbuildable_boundary, _ = _synthetic_patch()
+    regions.append({
+        "boundary_loop": unbuildable_boundary,
+        "interior_curves": [],
+        "smoothing_tolerance_mm": 0.3,
+        "max_section_spacing_mm": 999.0,
+    })
+
+    data = {"regions": regions}
+
+    output_path = tmp_path / "surface.step"
+
+    step_export.build_step_surfaces(data, str(output_path))
+
+    assert output_path.exists()
+
+    content = output_path.read_text(encoding="utf-8", errors="ignore")
+
+    # Only the 2 buildable regions made it into the file.
     assert content.count("ADVANCED_FACE") == 2

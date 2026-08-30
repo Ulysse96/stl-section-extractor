@@ -223,6 +223,15 @@ every resulting panel gets its own retry-with-looser-tolerance attempt
 before being written to one STEP file. No clicks (or just one point)
 — the default — keeps the single-surface behaviour unchanged.
 
+If one panel still can't be fit after every retry (a seam traced too
+close to an existing panel edge can carve off a thin, hard-to-fit
+sliver — confirmed on a real scan), that panel is skipped, with a
+clear message saying so — the STEP file still gets written with every
+OTHER panel that did succeed, rather than the whole export coming up
+empty over one bad seam. Retrace that specific seam (further from the
+existing boundary) and re-run if the skipped panel was actually
+needed.
+
 **Only edge-to-edge seams are supported for now**: both ends of a seam
 must land on the outer boundary (of the panel being split). A seam
 fully enclosed inside a panel's outline (a button, a back tab — not

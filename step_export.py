@@ -521,19 +521,45 @@ def build_step_surfaces(data, output_path):
 
     Each region is built independently via _build_region_face (same
     retry-with-looser-tolerance behaviour as always -- see the
-    comment above RETRY_TOLERANCE_FACTOR/MAX_RETRIES).
+    comment above RETRY_TOLERANCE_FACTOR/MAX_RETRIES). A region that
+    still can't be fit after every retry is SKIPPED (with a clear
+    warning) rather than aborting the whole export -- a seam traced
+    too close to an existing panel edge can carve off a thin,
+    hard-to-fit sliver without making every OTHER, perfectly fine
+    region unusable too. Only raises if NONE of the regions could be
+    built at all.
     """
 
     regions = data["regions"]
 
     faces = []
+    built_regions = []
 
     for i, region_data in enumerate(regions, start=1):
 
         if len(regions) > 1:
             print(f"Region {i}/{len(regions)}:")
 
-        faces.append(_build_region_face(region_data))
+        try:
+            faces.append(_build_region_face(region_data))
+            built_regions.append(region_data)
+        except RuntimeError as exc:
+            print(f"  Skipping this region -- {exc}")
+
+    if not faces:
+        raise RuntimeError(
+            "Could not build a valid surface for any region."
+        )
+
+    if len(faces) < len(regions):
+        print(
+            f"{len(regions) - len(faces)} of {len(regions)} region(s) "
+            "could not be built and were skipped -- the STEP file "
+            "only contains the rest. A seam traced too close to an "
+            "existing panel edge can carve off a thin, hard-to-fit "
+            "sliver; try retracing that seam further from the "
+            "existing boundary."
+        )
 
     if len(faces) == 1:
 
@@ -545,7 +571,7 @@ def build_step_surfaces(data, output_path):
             region_data.get(
                 "smoothing_tolerance_mm", DEFAULT_SMOOTHING_TOLERANCE_MM
             )
-            for region_data in regions
+            for region_data in built_regions
         ) * SEWING_TOLERANCE_FACTOR
 
         sewer = BRepBuilderAPI_Sewing(sewing_tolerance)
