@@ -13,6 +13,7 @@ from curve_utils import (
     resample,
     smooth_curve,
     split_boundary_and_curves_at_separator,
+    split_into_panels,
     stitch_curve_fragments,
 )
 
@@ -520,4 +521,80 @@ def test_split_boundary_and_curves_at_separator_rejects_a_degenerate_separator()
 
     with pytest.raises(ValueError):
         split_boundary_and_curves_at_separator(boundary, {}, separator)
+
+
+# --------------------------------------------------------------
+# split_into_panels
+# --------------------------------------------------------------
+
+def _rectangle_boundary_loop(width, height):
+    boundary = []
+    for x in np.linspace(0, width, 3 * width + 1):
+        boundary.append([x, 0, 0])
+    for y in np.linspace(0, height, 2 * height + 1)[1:]:
+        boundary.append([width, y, 0])
+    for x in np.linspace(width, 0, 3 * width + 1)[1:]:
+        boundary.append([x, height, 0])
+    for y in np.linspace(height, 0, 2 * height + 1)[1:-1]:
+        boundary.append([0, y, 0])
+    return np.array(boundary, dtype=float)
+
+
+def test_split_into_panels_with_no_separators_returns_one_panel():
+    boundary = _rectangle_boundary_loop(6, 4)
+    main_curves = {
+        0: np.array([[3, 0, 0], [3, 2, 0], [3, 4, 0]], dtype=float),
+    }
+
+    panels = split_into_panels(boundary, main_curves, [])
+
+    assert len(panels) == 1
+    assert len(panels[0]["interior_curves"]) == 1
+
+
+def test_split_into_panels_applies_two_independent_separators():
+    # A 6x4 rectangle cut into 3 vertical strips by two independent
+    # separators (x=2 and x=4) -- neither separator shares an
+    # endpoint with the other, standing in for "visor" and "back tab"
+    # seams traced independently on the same patch.
+    boundary = _rectangle_boundary_loop(6, 4)
+
+    separator_1 = np.array([[2, 0, 0], [2, 2, 0], [2, 4, 0]], dtype=float)
+    separator_2 = np.array([[4, 0, 0], [4, 2, 0], [4, 4, 0]], dtype=float)
+
+    main_curves = {
+        "left": np.array([[1, 0, 0], [1, 2, 0], [1, 4, 0]], dtype=float),
+        "middle": np.array([[3, 0, 0], [3, 2, 0], [3, 4, 0]], dtype=float),
+        "right": np.array([[5, 0, 0], [5, 2, 0], [5, 4, 0]], dtype=float),
+    }
+
+    panels = split_into_panels(
+        boundary, main_curves, [separator_1, separator_2]
+    )
+
+    assert len(panels) == 3
+
+    # Each panel got exactly its own strip's curve, whole.
+    x_means = sorted(
+        panel["interior_curves"][0][:, 0].mean() for panel in panels
+    )
+    assert x_means == pytest.approx([1, 3, 5])
+
+    for panel in panels:
+        assert len(panel["interior_curves"]) == 1
+
+
+def test_split_into_panels_rejects_a_separator_crossing_two_panels():
+    boundary = _rectangle_boundary_loop(6, 4)
+
+    # First separator splits the rectangle at x=2 into two panels.
+    separator_1 = np.array([[2, 0, 0], [2, 2, 0], [2, 4, 0]], dtype=float)
+
+    # Second separator runs from x=1 (inside the first, smaller panel)
+    # to x=5 (inside the second, larger panel) -- crosses between
+    # panels rather than staying within one.
+    separator_2 = np.array([[1, 0, 0], [3, 2, 0], [5, 4, 0]], dtype=float)
+
+    with pytest.raises(ValueError):
+        split_into_panels(boundary, {}, [separator_1, separator_2])
 

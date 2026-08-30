@@ -984,8 +984,9 @@ def split_boundary_and_curves_at_separator(
     per side) at the point where its own region classification
     changes.
 
-    Only supports ONE separator (splitting into exactly 2 regions,
-    not N) -- deliberately scoped this way for now; see the README.
+    Splits into exactly 2 regions along ONE separator. See
+    split_into_panels for applying several separators, each further
+    subdividing one existing region.
     """
 
     boundary_loop_points = np.asarray(boundary_loop_points, dtype=float)
@@ -1103,3 +1104,70 @@ def split_boundary_and_curves_at_separator(
             "interior_curves": region_2_curves,
         },
     ]
+
+
+def split_into_panels(boundary_loop_points, main_curves, separators):
+    """
+    Splits a disk-like patch into several panels from a list of
+    independently-traced separators (e.g. one seam between the crown
+    and the visor, another between the crown and a back tab) --
+    each separator further subdivides whichever ONE of the panels
+    built so far its own two ends land closest to, via
+    split_boundary_and_curves_at_separator. Both of a separator's
+    ends must land on the SAME current panel's boundary (tracing one
+    separator across what are already two different panels isn't
+    supported -- trace it within a single existing panel instead).
+
+    `separators` is a list of (M, 3) point arrays, one per traced
+    seam, applied in order. Returns a list of panel dicts (same shape
+    as split_boundary_and_curves_at_separator's own return value) --
+    a single panel covering the whole patch if `separators` is empty.
+    """
+
+    regions = [{
+        "boundary_loop": np.asarray(boundary_loop_points, dtype=float),
+        "interior_curves": [
+            np.asarray(points, dtype=float)
+            for points in main_curves.values()
+            if len(points) >= 2
+        ],
+    }]
+
+    def nearest_region_index(point):
+
+        distances = [
+            np.linalg.norm(region["boundary_loop"] - point, axis=1).min()
+            for region in regions
+        ]
+
+        return int(np.argmin(distances))
+
+    for separator_points in separators:
+
+        separator_points = np.asarray(separator_points, dtype=float)
+
+        start_region = nearest_region_index(separator_points[0])
+        end_region = nearest_region_index(separator_points[-1])
+
+        if start_region != end_region:
+            raise ValueError(
+                "This separator's two ends landed on different "
+                "existing panels -- trace each separator within a "
+                "single panel (one already-split-off region), not "
+                "across panels that were already split apart."
+            )
+
+        target = regions[start_region]
+
+        target_curves = {
+            i: points
+            for i, points in enumerate(target["interior_curves"])
+        }
+
+        split_result = split_boundary_and_curves_at_separator(
+            target["boundary_loop"], target_curves, separator_points
+        )
+
+        regions[start_region:start_region + 1] = split_result
+
+    return regions

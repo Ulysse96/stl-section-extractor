@@ -19,7 +19,7 @@ from curve_utils import (
     build_simple_spline_curve,
     collect_curve_endpoints,
     order_boundary_loop,
-    split_boundary_and_curves_at_separator,
+    split_into_panels,
 )
 
 
@@ -1857,12 +1857,14 @@ surface_boundary_loop_points = (
 # directly -- and neither ShapeFix_Shape nor BRepLib.SameParameter_s
 # could shrink it, since the gap is a real geometric fact, not a
 # stale tolerance flag). Tracing a seam here (e.g. where the visor
-# meets the crown) splits the patch into two simpler, individually
+# meets the crown) splits the patch into simpler, individually
 # better-behaved surfaces instead -- see
-# curve_utils.split_boundary_and_curves_at_separator. Only ONE
-# separator is supported for now; see the README.
+# curve_utils.split_into_panels. Any number of seams can be traced,
+# each further subdividing whichever ONE panel (of everything split
+# off so far) its own two ends land within -- see the README.
 
-separator_points = []
+separator_lines = []
+current_separator_line = []
 
 if use_plane_b and surface_boundary_loop_points is not None:
 
@@ -1875,9 +1877,13 @@ if use_plane_b and surface_boundary_loop_points is not None:
         "Click a sequence of points along a seam on the mesh (e.g.\n"
         "where a cap's visor meets its crown), both ends near the\n"
         "outer edge, to reconstruct that region as its own simpler\n"
-        "surface instead of one surface for everything. Close the\n"
-        "window when done (no clicks, or just one, = one single\n"
-        "surface, as usual)."
+        "surface instead of one surface for everything. Press 'n' to\n"
+        "finish the current seam and start another one -- each seam\n"
+        "must stay within a single existing panel (trace the\n"
+        "crown/visor seam first; a seam splitting off another panel\n"
+        "has to be traced within one of the results, not across two\n"
+        "already-split panels). Close the window when done (no\n"
+        "clicks, or just one point, = one single surface, as usual)."
     )
 
     separator_plotter = pv.Plotter(
@@ -1892,10 +1898,14 @@ if use_plane_b and surface_boundary_loop_points is not None:
 
     separator_plotter.add_text(
         "SEPARATE INTO PANELS - click points along a seam, both ends "
-        "near the outer edge (optional)",
+        "near the outer edge. Press 'n' for another seam (optional)",
         position="upper_left",
         font_size=16
     )
+
+    separator_colors = [
+        "yellow", "cyan", "magenta", "orange", "lime", "red"
+    ]
 
     separator_picker = vtk.vtkCellPicker()
     separator_picker.SetTolerance(0.001)
@@ -1919,25 +1929,30 @@ if use_plane_b and surface_boundary_loop_points is not None:
             separator_picker.GetPickPosition()
         )
 
-        separator_points.append(point)
+        current_separator_line.append(point)
 
         print(
-            f"  Separator point {len(separator_points)}: "
-            f"X={point[0]:.4f}, Y={point[1]:.4f}, Z={point[2]:.4f}"
+            f"  Seam {len(separator_lines) + 1}, point "
+            f"{len(current_separator_line)}: X={point[0]:.4f}, "
+            f"Y={point[1]:.4f}, Z={point[2]:.4f}"
         )
 
-        if len(separator_points) >= 2:
+        color = separator_colors[
+            len(separator_lines) % len(separator_colors)
+        ]
+
+        if len(current_separator_line) >= 2:
 
             line = pv.lines_from_points(
-                np.array(separator_points),
+                np.array(current_separator_line),
                 close=False
             )
 
             separator_plotter.add_mesh(
                 line,
-                color="yellow",
+                color=color,
                 line_width=5,
-                name="separator_line"
+                name=f"separator_line_{len(separator_lines)}"
             )
 
         marker = pv.PolyData(
@@ -1946,41 +1961,74 @@ if use_plane_b and surface_boundary_loop_points is not None:
 
         separator_plotter.add_mesh(
             marker,
-            color="yellow",
+            color=color,
             point_size=14,
             render_points_as_spheres=True,
-            name=f"separator_point_{len(separator_points)}"
+            name=(
+                f"separator_point_{len(separator_lines)}_"
+                f"{len(current_separator_line)}"
+            )
         )
 
         separator_plotter.render()
+
+    def separator_next_line():
+
+        if len(current_separator_line) >= 2:
+
+            separator_lines.append(list(current_separator_line))
+
+            print(
+                f"  Seam {len(separator_lines)} finished "
+                f"({len(current_separator_line)} points)."
+            )
+
+            current_separator_line.clear()
+
+        else:
+
+            print(
+                "  Need at least 2 points before starting another "
+                "seam -- ignored."
+            )
 
     separator_plotter.iren.add_observer(
         "LeftButtonPressEvent",
         separator_click
     )
 
+    separator_plotter.add_key_event("n", separator_next_line)
+
     separator_plotter.add_axes()
 
     separator_plotter.show()
 
-    if len(separator_points) >= 2:
-        print(f"  Separator traced ({len(separator_points)} points).")
+    if len(current_separator_line) >= 2:
+
+        separator_lines.append(list(current_separator_line))
+
+        print(
+            f"  Seam {len(separator_lines)} finished "
+            f"({len(current_separator_line)} points)."
+        )
+
+    if separator_lines:
+        print(f"  {len(separator_lines)} seam(s) traced.")
     else:
-        print("  No separator traced -- using one single surface.")
-        separator_points = []
+        print("  No seam traced -- using one single surface.")
 
 if surface_boundary_loop_points is None:
 
     surface_regions = []
 
-elif len(separator_points) >= 2:
+elif separator_lines:
 
     try:
 
-        surface_regions = split_boundary_and_curves_at_separator(
+        surface_regions = split_into_panels(
             surface_boundary_loop_points,
             surface_main_curves,
-            np.array(separator_points)
+            [np.array(line) for line in separator_lines]
         )
 
     except ValueError as exc:

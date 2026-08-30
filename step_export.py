@@ -296,9 +296,30 @@ def build_single_surface(
     mode on a genuinely complex shape, not just a hypothetical one.
     """
 
+    # MaxDeg (the filler's 9th argument) matters well beyond its own
+    # trimmed geometry: a real SolidWorks import showed a "visor"
+    # panel as a bizarre, disconnected blade far from the crown, even
+    # though this project's own checks passed it and re-reading the
+    # actual STEP file back independently confirmed the real, TRIMMED
+    # face was fine. Root cause, confirmed directly: at MaxDeg=8 the
+    # surface's raw, UNTRIMMED control points reached +-17800mm for a
+    # face whose real (trimmed) extent is under 300mm -- SolidWorks'
+    # own STEP import evidently samples/renders closer to that raw,
+    # untrimmed representation for at least some faces, unlike
+    # OpenCASCADE's own BRepMesh_IncrementalMesh (which only ever
+    # triangulates the real, trimmed region -- see
+    # _surface_deviates_from_data's own comment on exactly this trap).
+    # Lowered from 8 to 5 after sweeping MaxDeg against this project's
+    # two real regions from that same scan (a domed crown and a
+    # near-flat visor): 5 is the largest value where BOTH regions
+    # still found a valid fit (at the same tolerances the existing
+    # retry loop already reaches for them), while cutting raw pole
+    # spread by roughly an order of magnitude versus 8. MaxDeg=3 was
+    # tried too and cut it further, but was too restrictive for the
+    # more complex crown region to fit at all.
     filler = BRepOffsetAPI_MakeFilling(
         3, 15, 3, False, 1e-5,
-        smoothing_tolerance_mm, 0.01, 0.1, 8, 9
+        smoothing_tolerance_mm, 0.01, 0.1, 5, 9
     )
 
     boundary_points = np.asarray(boundary_points, dtype=float)

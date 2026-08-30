@@ -200,22 +200,45 @@ visor and a domed crown at once is a lot to ask of a single fit.
 
 After the "EXCLUDE SECTIONS" window, a "SEPARATE INTO PANELS" window
 opens: click a sequence of points along a seam directly on the mesh
-(e.g. where the visor meets the crown), both ends near the outer edge,
-then close the window. That seam splits the patch into two separate,
-individually simpler surfaces (`curve_utils.split_boundary_and_curves_
-at_separator`) instead of one surface spanning both regions' curvature
-— each gets its own retry-with-looser-tolerance attempt (see above),
-and the two are sewn together at the shared seam before being written
-to one STEP file. No clicks (or just one) — the default — keeps
-today's single-surface behaviour unchanged.
+(e.g. where the visor meets the crown), both ends near the outer edge.
+Press `n` to finish that seam and trace another one — each further
+seam must stay within a single panel already split off so far (trace
+the crown/visor seam first; a seam splitting a *further* panel off has
+to be traced within one of those two results, not across both at
+once). Close the window when done. Each seam splits its own panel into
+two separate, individually simpler surfaces
+(`curve_utils.split_into_panels`, built on
+`split_boundary_and_curves_at_separator` applied once per seam)
+instead of one surface spanning every region's curvature at once —
+every resulting panel gets its own retry-with-looser-tolerance attempt
+(see above), and all of them are sewn together at their shared seams
+before being written to one STEP file. No clicks (or just one point)
+— the default — keeps the single-surface behaviour unchanged.
 
-**Only one separator is supported for now**: enough to validate a
-crown/visor-style split end to end, without building a general
-multi-seam decomposition blind, with no way to test it interactively
-against a real, complex, noisy scan. A seam fully enclosed inside
-another panel's outline (a button, a back tab — not touching the outer
-edge) isn't supported yet either; only seams whose two ends both land
-on the outer boundary.
+**Only edge-to-edge seams are supported for now**: both ends of a seam
+must land on the outer boundary (of the panel being split). A seam
+fully enclosed inside a panel's outline (a button, a back tab — not
+touching any outer edge) isn't supported yet.
+
+**A "good" surface can still render wrong in SolidWorks specifically**:
+even with real, correct geometry (independently re-verified: reading
+the actual STEP file back and triangulating each face confirmed both a
+crown and a visor panel matched the real scan closely), SolidWorks
+showed the visor as a bizarre, disconnected blade far from the crown.
+Root cause, confirmed directly: at the filler's previous `MaxDeg=8`,
+the fitted surface's raw, UNTRIMMED control points reached ±17800mm
+for a face whose real (trimmed) extent is under 300mm — topologically
+harmless (OpenCASCADE's own `BRepMesh_IncrementalMesh` only ever
+triangulates the real, trimmed region, which is why this project's own
+checks and a fresh re-read both looked fine), but SolidWorks' STEP
+import evidently samples/renders closer to that raw, untrimmed
+representation for at least some faces. Lowered `MaxDeg` from 8 to 5 —
+swept against this project's own real crown + visor regions: 5 is the
+largest value where both still found a valid fit (at the same
+tolerances the existing retry loop already reaches for them), while
+cutting the raw control points' spread by roughly an order of
+magnitude. `MaxDeg=3` cut it further but was too restrictive for the
+more complex crown region to fit at all.
 
 `section_stl.py` also exports `sections_3d/boundary_loop.dxf` (and
 includes the same spline in `sections_main_3d.dxf`): a single closed
