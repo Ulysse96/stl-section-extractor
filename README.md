@@ -10,6 +10,14 @@ pip install -r requirements.txt
 python section_stl.py
 ```
 
+**On Windows, prefer double-clicking [run_section_stl.bat](run_section_stl.bat)**
+over running/double-clicking `section_stl.py` directly: a Python script's own
+console window closes itself the instant the script exits, whether it
+finished normally or crashed — so a crash's error message is gone before
+you can read it. The `.bat` file captures everything into `log.txt`, prints
+it back to the console, and waits for a key press before closing, so the
+window (and `log.txt`) always has the full output, even after a crash.
+
 1. A file dialog opens — select the STL to process.
 2. A 3D view opens — click 3 points (plane A only) or 5 points (plane A +
    perpendicular plane B) on the mesh to define the cutting plane(s), then
