@@ -19,7 +19,7 @@ from curve_utils import (
     build_simple_spline_curve,
     collect_curve_endpoints,
     order_boundary_loop,
-    split_into_panels,
+    assign_points_to_panels,
 )
 
 
@@ -234,6 +234,238 @@ print(
     f"Min curve length    : {MIN_CURVE_LENGTH_MM:.3f} mm "
     f"({MIN_CURVE_LENGTH_FACTOR:.1f} x edge length)"
 )
+
+
+# ============================================================
+# 2ter. SEPARATE INTO PANELS (optional)
+# ============================================================
+#
+# A single global surface asks one B-spline to reconcile every
+# region's curvature at once -- confirmed as the direct cause of a
+# real SolidWorks import failure ("no geometry data"): the fitted
+# surface's own boundary edge ended up 14-33mm off from the requested
+# boundary loop, regardless of smoothing tolerance, because a single
+# degree-8 fit couldn't reconcile a cap's near-flat visor and domed
+# crown at once. An earlier version of this project split the CURVE
+# NETWORK into panels after the whole mesh had already been sliced --
+# snapping a seam's ends to the nearest point in an existing boundary
+# array, re-deriving each panel's boundary from an arc of that array.
+# It kept failing in sharp-edged ways traceable to exactly that: a
+# seam snapped to an adjacent boundary index once produced a 3-point
+# "boundary" that still passed every downstream check while building
+# a physically twisted surface. Splitting the MESH itself, here,
+# before any A/B slicing happens at all, avoids that whole class of
+# failure structurally: each resulting sub-mesh gets its own boundary
+# loop the normal way once IT is sliced on its own, later (see
+# process_panel, below) -- there is no array to snap to at all.
+#
+# This only matters if you go on to pick plane B (5 points) and use
+# STEP export -- if you're only using plane A for DXF curves, just
+# close this window without clicking anything.
+
+panel_separator_lines = []
+current_panel_separator_line = []
+
+print()
+print("======================================")
+print("SEPARATE INTO PANELS (optional)")
+print("======================================")
+
+print(
+    "Only relevant if you'll go on to use STEP export (5-point plane\n"
+    "selection, below). Click a sequence of points along a seam on\n"
+    "the mesh (e.g. where a cap's visor meets its crown), both ends\n"
+    "near the outer edge, to reconstruct that region as its own\n"
+    "simpler surface later instead of one surface for everything.\n"
+    "Press 'n' to finish the current seam and start another one --\n"
+    "each seam must stay within a single existing panel (trace the\n"
+    "crown/visor seam first; a seam splitting off another panel has\n"
+    "to be traced within one of the results, not across two\n"
+    "already-split panels). Close the window when done (no clicks,\n"
+    "or just one point, = one single surface later, as usual)."
+)
+
+panel_plotter = pv.Plotter(
+    window_size=(1500, 950)
+)
+
+panel_plotter.add_mesh(
+    mesh,
+    color="lightgray",
+    opacity=0.5
+)
+
+panel_plotter.add_text(
+    "SEPARATE INTO PANELS - click points along a seam, both ends "
+    "near the outer edge. Press 'n' for another seam (optional)",
+    position="upper_left",
+    font_size=16
+)
+
+panel_separator_colors = [
+    "yellow", "cyan", "magenta", "orange", "lime", "red"
+]
+
+panel_separator_picker = vtk.vtkCellPicker()
+panel_separator_picker.SetTolerance(0.001)
+
+
+def panel_separator_click(caller, event):
+
+    x, y = caller.GetEventPosition()
+
+    panel_separator_picker.Pick(
+        x,
+        y,
+        0,
+        panel_plotter.renderer
+    )
+
+    if panel_separator_picker.GetCellId() < 0:
+        print("No surface detected.")
+        return
+
+    point = np.array(
+        panel_separator_picker.GetPickPosition()
+    )
+
+    current_panel_separator_line.append(point)
+
+    print(
+        f"  Seam {len(panel_separator_lines) + 1}, point "
+        f"{len(current_panel_separator_line)}: X={point[0]:.4f}, "
+        f"Y={point[1]:.4f}, Z={point[2]:.4f}"
+    )
+
+    color = panel_separator_colors[
+        len(panel_separator_lines) % len(panel_separator_colors)
+    ]
+
+    if len(current_panel_separator_line) >= 2:
+
+        line = pv.lines_from_points(
+            np.array(current_panel_separator_line),
+            close=False
+        )
+
+        panel_plotter.add_mesh(
+            line,
+            color=color,
+            line_width=5,
+            name=f"panel_separator_line_{len(panel_separator_lines)}"
+        )
+
+    marker = pv.PolyData(
+        point.reshape(1, 3)
+    )
+
+    panel_plotter.add_mesh(
+        marker,
+        color=color,
+        point_size=14,
+        render_points_as_spheres=True,
+        name=(
+            f"panel_separator_point_{len(panel_separator_lines)}_"
+            f"{len(current_panel_separator_line)}"
+        )
+    )
+
+    panel_plotter.render()
+
+
+def panel_separator_next_line():
+
+    if len(current_panel_separator_line) >= 2:
+
+        panel_separator_lines.append(list(current_panel_separator_line))
+
+        print(
+            f"  Seam {len(panel_separator_lines)} finished "
+            f"({len(current_panel_separator_line)} points)."
+        )
+
+        current_panel_separator_line.clear()
+
+    else:
+
+        print(
+            "  Need at least 2 points before starting another "
+            "seam -- ignored."
+        )
+
+
+panel_plotter.iren.add_observer(
+    "LeftButtonPressEvent",
+    panel_separator_click
+)
+
+panel_plotter.add_key_event("n", panel_separator_next_line)
+
+panel_plotter.add_axes()
+
+panel_plotter.show()
+
+if len(current_panel_separator_line) >= 2:
+
+    panel_separator_lines.append(list(current_panel_separator_line))
+
+    print(
+        f"  Seam {len(panel_separator_lines)} finished "
+        f"({len(current_panel_separator_line)} points)."
+    )
+
+if panel_separator_lines:
+    print(f"  {len(panel_separator_lines)} seam(s) traced.")
+else:
+    print("  No seam traced -- using one single surface/panel.")
+
+
+def split_mesh_into_panels(whole_mesh, separator_lines):
+    """
+    Splits `whole_mesh` into sub-meshes along `separator_lines` (each
+    an (M, 3) point array traced on the mesh surface): classifies
+    every mesh cell by which side of the seam(s) its own centroid
+    falls on (curve_utils.assign_points_to_panels), then extracts the
+    corresponding sub-mesh for each resulting label. Returns a list
+    of (label, sub_mesh) -- [("", whole_mesh)] unchanged (a single
+    "panel", no subfolder) when there are no seams to apply.
+    """
+
+    if not separator_lines:
+        return [("", whole_mesh)]
+
+    centroids = whole_mesh.cell_centers().points
+
+    labels, skipped = assign_points_to_panels(
+        centroids,
+        [np.array(line) for line in separator_lines]
+    )
+
+    for seam_index, reason in skipped:
+        print(
+            f"  Seam {seam_index + 1} could not be applied and was "
+            f"skipped -- {reason}"
+        )
+
+    panels = []
+
+    for label in sorted(set(labels.tolist())):
+
+        cell_indices = np.nonzero(labels == label)[0]
+
+        sub_mesh = whole_mesh.extract_cells(
+            cell_indices
+        ).extract_surface(algorithm="dataset_surface")
+
+        panels.append((str(label + 1), sub_mesh))
+
+    return panels
+
+
+panel_meshes = split_mesh_into_panels(mesh, panel_separator_lines)
+
+if len(panel_meshes) > 1:
+    print(f"  Split into {len(panel_meshes)} panel(s).")
 
 
 # ============================================================
@@ -890,139 +1122,6 @@ if use_plane_b:
 
 
 # ============================================================
-# 5bis. PLANE x PLANE x MESH INTERSECTION POINTS (validation)
-# ============================================================
-#
-# Two perpendicular cutting planes (one from each family) share
-# a 3D line. Where that line pierces the actual scanned mesh
-# tells us WHICH (A, B) plane pairs genuinely cross the object
-# at all, and how many times (a fold/curl can make a pair cross
-# more than once). This is used later purely as a lookup: which
-# pairs of FINAL curves to check, and how many distinct
-# crossings to expect between them (step 12ter). It does not
-# feed any point into a curve -- see step 12ter for why.
-
-
-def compute_plane_intersections(
-    mesh_obj,
-    shared_point,
-    normal_a_vec,
-    normal_b_vec,
-    offsets_a_list,
-    offsets_b_list
-):
-    """
-    For every pair of (plane A at offset i, plane B at offset
-    j), computes the 3D line the two planes share, then finds
-    every point where that line crosses the mesh surface via
-    ray tracing. Returns a dict keyed by (i, j) (1-based section
-    numbers) -> list of ALL intersection points found (usually
-    one, but can be more where the surface folds back on itself,
-    e.g. a curled brim). These are only used downstream as a
-    validation gate and an expected crossing COUNT: the actual
-    location used for each crossing is found later, directly on
-    the final (smoothed/reconstructed) curves (step 12ter), so
-    keeping every raw hit here is safe -- there is no risk of
-    forcing the wrong one onto a curve, unlike when this used to
-    insert points before any curve processing.
-    """
-
-    line_direction = np.cross(normal_a_vec, normal_b_vec)
-    line_direction /= np.linalg.norm(line_direction)
-
-    ray_half_length = mesh_obj.length * 1.5
-
-    intersections = {}
-
-    for i, offset_a in enumerate(offsets_a_list, start=1):
-
-        origin_a = shared_point + offset_a * normal_a_vec
-
-        d_a = np.dot(normal_a_vec, origin_a)
-
-        for j, offset_b in enumerate(offsets_b_list, start=1):
-
-            origin_b = shared_point + offset_b * normal_b_vec
-
-            d_b = np.dot(normal_b_vec, origin_b)
-
-            # A point on the shared line (valid since normal_a
-            # and normal_b are orthonormal).
-            line_point = (
-                d_a * normal_a_vec
-                +
-                d_b * normal_b_vec
-            )
-
-            ray_start = line_point - ray_half_length * line_direction
-            ray_end = line_point + ray_half_length * line_direction
-
-            hits, _ = mesh_obj.ray_trace(
-                ray_start,
-                ray_end,
-                first_point=False
-            )
-
-            if len(hits) == 0:
-                continue
-
-            intersections[(i, j)] = hits
-
-    return intersections
-
-
-plane_intersections = {}
-
-if use_plane_b:
-
-    print()
-    print("======================================")
-    print("COMPUTING PLANE x PLANE x MESH INTERSECTIONS")
-    print("======================================")
-
-    offsets_a_precompute = np.linspace(
-        -width_a / 2,
-        width_a / 2,
-        number_of_sections_a
-    )
-
-    offsets_b_precompute = np.linspace(
-        -width_b / 2,
-        width_b / 2,
-        number_of_sections_b
-    )
-
-    plane_intersections = compute_plane_intersections(
-        mesh,
-        p1,
-        normal_a,
-        normal_b,
-        offsets_a_precompute,
-        offsets_b_precompute
-    )
-
-    total_hits = sum(
-        len(hits) for hits in plane_intersections.values()
-    )
-
-    multi_hit_pairs = sum(
-        1 for hits in plane_intersections.values() if len(hits) > 1
-    )
-
-    print(
-        f"  {len(plane_intersections)} plane pair(s) with at "
-        f"least one crossing out of "
-        f"{number_of_sections_a * number_of_sections_b} "
-        f"plane pairs."
-    )
-
-    print(
-        f"  {total_hits} individual mesh crossing(s) found "
-        f"({multi_hit_pairs} pair(s) cross more than once)."
-    )
-
-
-# ============================================================
 # 8. OUTPUT DIRECTORY
 # ============================================================
 
@@ -1046,1984 +1145,1975 @@ os.makedirs(
 )
 
 
-def _insert_points_into_curve(curve_points, points_to_insert):
+
+def process_panel(mesh, output_dir):
     """
-    Inserts each point in `points_to_insert` into the ordered
-    polyline `curve_points`, at whichever existing segment it is
-    geometrically closest to, WITHOUT moving any existing point.
-    Used to force a curve to pass exactly through known
-    A x B intersection points.
+    Runs the ENTIRE per-mesh extraction/reconstruction/export
+    pipeline (originally this whole script's own top-to-bottom
+    body, before mesh-first panel splitting) against `mesh` --
+    the ORIGINAL whole mesh in the common case, or one panel's
+    own sub-mesh (see split_mesh_into_panels above). Every
+    plane/parameter global this reads (p1, normal_a, width_a,
+    ...) was already chosen once, up front, on the original
+    whole mesh, and applies identically to every panel -- only
+    `mesh` and `output_dir` genuinely differ per call.
 
-    Returns (new_curve, inserted_indices) where
-    inserted_indices[k] is the index, in the returned array, of
-    points_to_insert[k].
+    Writes this panel's own DXF files under `output_dir`.
+    Returns (boundary_loop_points, main_curves) -- this panel's
+    own contribution to the STEP export's surface_regions list.
     """
 
-    curve = [
-        np.asarray(p, dtype=float)
-        for p in curve_points
-    ]
-
-    inserted_indices = [None] * len(points_to_insert)
-
-    for original_order in range(len(points_to_insert)):
-
-        point = np.asarray(
-            points_to_insert[original_order],
-            dtype=float
-        )
-
-        best_seg = 0
-        best_dist = np.inf
-
-        for i in range(len(curve) - 1):
-
-            a = curve[i]
-            b = curve[i + 1]
-
-            ab = b - a
-            denom = np.dot(ab, ab)
-
-            t = (
-                0.0
-                if denom < 1e-12
-                else np.clip(np.dot(point - a, ab) / denom, 0.0, 1.0)
-            )
-
-            proj = a + t * ab
-
-            dist = np.linalg.norm(point - proj)
-
-            if dist < best_dist:
-                best_dist = dist
-                best_seg = i
-
-        insert_at = best_seg + 1
-
-        curve.insert(insert_at, point)
-
-        inserted_indices[original_order] = insert_at
-
-        for k in range(len(points_to_insert)):
-
-            if (
-                inserted_indices[k] is not None
-                and k != original_order
-                and inserted_indices[k] >= insert_at
-            ):
-
-                inserted_indices[k] += 1
-
-    return np.asarray(curve), inserted_indices
+    # ============================================================
+    # 5bis. PLANE x PLANE x MESH INTERSECTION POINTS (validation)
+    # ============================================================
+    #
+    # Two perpendicular cutting planes (one from each family) share
+    # a 3D line. Where that line pierces the actual scanned mesh
+    # tells us WHICH (A, B) plane pairs genuinely cross the object
+    # at all, and how many times (a fold/curl can make a pair cross
+    # more than once). This is used later purely as a lookup: which
+    # pairs of FINAL curves to check, and how many distinct
+    # crossings to expect between them (step 12quater). It does not
+    # feed any point into a curve -- see step 12quater for why.
 
 
-# ============================================================
-# 10. EXTRACT CURVES FROM SECTION
-# ============================================================
+    def compute_plane_intersections(
+        mesh_obj,
+        shared_point,
+        normal_a_vec,
+        normal_b_vec,
+        offsets_a_list,
+        offsets_b_list
+    ):
+        """
+        For every pair of (plane A at offset i, plane B at offset
+        j), computes the 3D line the two planes share, then finds
+        every point where that line crosses the mesh surface via
+        ray tracing. Returns a dict keyed by (i, j) (1-based section
+        numbers) -> list of ALL intersection points found (usually
+        one, but can be more where the surface folds back on itself,
+        e.g. a curled brim). These are only used downstream as a
+        validation gate and an expected crossing COUNT: the actual
+        location used for each crossing is found later, directly on
+        the final (smoothed/reconstructed) curves (step 12quater), so
+        keeping every raw hit here is safe -- there is no risk of
+        forcing the wrong one onto a curve, unlike when this used to
+        insert points before any curve processing.
+        """
 
-def extract_curves(section):
+        line_direction = np.cross(normal_a_vec, normal_b_vec)
+        line_direction /= np.linalg.norm(line_direction)
 
-    lines = section.lines
+        ray_half_length = mesh_obj.length * 1.5
 
-    if lines is None or len(lines) == 0:
-        return []
+        intersections = {}
 
-    lines = lines.reshape(
-        -1,
-        3
-    )
+        for i, offset_a in enumerate(offsets_a_list, start=1):
 
-    edges = []
+            origin_a = shared_point + offset_a * normal_a_vec
 
-    for _, a, b in lines:
+            d_a = np.dot(normal_a_vec, origin_a)
 
-        a = int(a)
-        b = int(b)
+            for j, offset_b in enumerate(offsets_b_list, start=1):
 
-        if a != b:
+                origin_b = shared_point + offset_b * normal_b_vec
 
-            edges.append(
-                (a, b)
-            )
+                d_b = np.dot(normal_b_vec, origin_b)
 
-
-    # --------------------------------------------------------
-    # Build graph
-    # --------------------------------------------------------
-
-    neighbors = {}
-
-    for a, b in edges:
-
-        neighbors.setdefault(
-            a,
-            []
-        ).append(b)
-
-        neighbors.setdefault(
-            b,
-            []
-        ).append(a)
-
-
-    # --------------------------------------------------------
-    # Find endpoints
-    # --------------------------------------------------------
-
-    endpoints = [
-        node
-        for node, neigh
-        in neighbors.items()
-        if len(neigh) == 1
-    ]
-
-
-    # --------------------------------------------------------
-    # Follow paths
-    # --------------------------------------------------------
-
-    def follow(start):
-
-        # ------------------------------------------------------
-        # A un pli / defaut de surface, plusieurs aretes se
-        # rejoignent parfois au meme point (noeud "en branche",
-        # non filaire). Prendre arbitrairement la premiere
-        # branche coupait la courbe en plein milieu. On choisit
-        # ici la branche qui prolonge le plus "tout droit" la
-        # direction deja suivie, ce qui reste sur le bon trajet
-        # meme au niveau d'un pli.
-        # ------------------------------------------------------
-
-        path = []
-
-        current = start
-        previous = None
-
-        while True:
-
-            path.append(
-                current
-            )
-
-            possible = [
-                n
-                for n in neighbors[current]
-                if n != previous
-                and n not in path
-            ]
-
-            if not possible:
-                break
-
-            if len(possible) == 1 or previous is None:
-
-                current, previous = possible[0], current
-
-            else:
-
-                prev_dir = (
-                    section.points[current]
-                    -
-                    section.points[previous]
+                # A point on the shared line (valid since normal_a
+                # and normal_b are orthonormal).
+                line_point = (
+                    d_a * normal_a_vec
+                    +
+                    d_b * normal_b_vec
                 )
 
-                prev_norm = np.linalg.norm(prev_dir)
+                ray_start = line_point - ray_half_length * line_direction
+                ray_end = line_point + ray_half_length * line_direction
 
-                if prev_norm > 1e-12:
-                    prev_dir = prev_dir / prev_norm
+                hits, _ = mesh_obj.ray_trace(
+                    ray_start,
+                    ray_end,
+                    first_point=False
+                )
 
-                best_candidate = None
-                best_score = -np.inf
+                if len(hits) == 0:
+                    continue
 
-                for candidate in possible:
+                intersections[(i, j)] = hits
 
-                    cand_dir = (
-                        section.points[candidate]
-                        -
-                        section.points[current]
-                    )
-
-                    cand_norm = np.linalg.norm(cand_dir)
-
-                    if cand_norm > 1e-12:
-                        cand_dir = cand_dir / cand_norm
-
-                    # score proche de 1 = continuation en ligne
-                    # droite, proche de -1 = demi-tour
-                    score = np.dot(prev_dir, cand_dir)
-
-                    if score > best_score:
-                        best_score = score
-                        best_candidate = candidate
-
-                current, previous = best_candidate, current
-
-        return path
+        return intersections
 
 
-    paths = []
+    plane_intersections = {}
 
-    used = set()
-
-
-    # Open curves first
-    for start in endpoints:
-
-        if start in used:
-            continue
-
-        path = follow(start)
-
-        for node in path:
-            used.add(node)
-
-        if len(path) >= 4:
-
-            paths.append(
-                path
-            )
-
-
-    # Remaining curves
-    remaining = [
-        n
-        for n in neighbors
-        if n not in used
-    ]
-
-    for start in remaining:
-
-        if start in used:
-            continue
-
-        path = follow(start)
-
-        for node in path:
-            used.add(node)
-
-        if len(path) >= 4:
-
-            paths.append(
-                path
-            )
-
-
-    curves = []
-
-    for path in paths:
-
-        curves.append(
-            section.points[path]
-        )
-
-
-    # --------------------------------------------------------
-    # Stitch fragments broken by folds / scan defects
-    #
-    # A pli or a small mesh defect can genuinely leave two
-    # separate line fragments in the graph (no shared vertex)
-    # even though the surface is continuous. If two fragment
-    # endpoints are spatially close (< STITCH_TOLERANCE_MM),
-    # they are almost certainly the same curve and are merged.
-    # --------------------------------------------------------
-
-    curves = stitch_curve_fragments(
-        curves,
-        STITCH_TOLERANCE_MM
-    )
-
-
-    # --------------------------------------------------------
-    # Discard short curves (noise loops / islands)
-    # --------------------------------------------------------
-
-    filtered_curves = []
-
-    for c in curves:
-
-        curve_length = np.sum(
-            np.linalg.norm(
-                np.diff(c, axis=0),
-                axis=1
-            )
-        ) if len(c) >= 2 else 0.0
-
-        if curve_length >= MIN_CURVE_LENGTH_MM:
-
-            filtered_curves.append(c)
-
-    return filtered_curves
-
-
-# ============================================================
-# 11. EXTRACT ALL SECTIONS (for one cutting direction)
-# ============================================================
-#
-# This is called once per cutting plane (A and B), each with
-# its own origin point, normal, in-plane basis (u, v), width
-# and section count. A single family of parallel sections in
-# only one direction is not enough to constrain a Loft/Boundary
-# Surface well (it only has cross-sections one way); running
-# this twice, once per perpendicular plane, produces a proper
-# two-direction curve network (like stations + buttock lines in
-# hull lofting) for SolidWorks to loft against in both
-# directions.
-
-def extract_all_sections_for_direction(
-    direction_label,
-    direction_origin_point,
-    direction_normal,
-    direction_u,
-    direction_v,
-    direction_width,
-    direction_count
-):
-
-    direction_offsets = np.linspace(
-        -direction_width / 2,
-        direction_width / 2,
-        direction_count
-    )
-
-    direction_data = []
-
-    for section_number, offset in enumerate(
-        direction_offsets,
-        start=1
-    ):
+    if use_plane_b:
 
         print()
-        print("--------------------------------------")
+        print("======================================")
+        print("COMPUTING PLANE x PLANE x MESH INTERSECTIONS")
+        print("======================================")
 
-        print(
-            f"PLANE {direction_label} - SECTION "
-            f"{section_number}/{direction_count}"
+        offsets_a_precompute = np.linspace(
+            -width_a / 2,
+            width_a / 2,
+            number_of_sections_a
+        )
+
+        offsets_b_precompute = np.linspace(
+            -width_b / 2,
+            width_b / 2,
+            number_of_sections_b
+        )
+
+        plane_intersections = compute_plane_intersections(
+            mesh,
+            p1,
+            normal_a,
+            normal_b,
+            offsets_a_precompute,
+            offsets_b_precompute
+        )
+
+        total_hits = sum(
+            len(hits) for hits in plane_intersections.values()
+        )
+
+        multi_hit_pairs = sum(
+            1 for hits in plane_intersections.values() if len(hits) > 1
         )
 
         print(
-            f"Offset = {offset:+.2f} mm"
+            f"  {len(plane_intersections)} plane pair(s) with at "
+            f"least one crossing out of "
+            f"{number_of_sections_a * number_of_sections_b} "
+            f"plane pairs."
+        )
+
+        print(
+            f"  {total_hits} individual mesh crossing(s) found "
+            f"({multi_hit_pairs} pair(s) cross more than once)."
         )
 
 
-        origin = (
-            direction_origin_point
-            +
-            offset * direction_normal
-        )
+    def _insert_points_into_curve(curve_points, points_to_insert):
+        """
+        Inserts each point in `points_to_insert` into the ordered
+        polyline `curve_points`, at whichever existing segment it is
+        geometrically closest to, WITHOUT moving any existing point.
+        Used to force a curve to pass exactly through known
+        A x B intersection points.
 
+        Returns (new_curve, inserted_indices) where
+        inserted_indices[k] is the index, in the returned array, of
+        points_to_insert[k].
+        """
 
-        section = mesh.slice(
-            normal=direction_normal,
-            origin=origin
-        )
+        curve = [
+            np.asarray(p, dtype=float)
+            for p in curve_points
+        ]
 
-        section = section.clean()
+        inserted_indices = [None] * len(points_to_insert)
 
+        for original_order in range(len(points_to_insert)):
 
-        if section.n_points == 0:
-
-            print(
-                "No intersection."
+            point = np.asarray(
+                points_to_insert[original_order],
+                dtype=float
             )
 
-            continue
+            best_seg = 0
+            best_dist = np.inf
+
+            for i in range(len(curve) - 1):
+
+                a = curve[i]
+                b = curve[i + 1]
+
+                ab = b - a
+                denom = np.dot(ab, ab)
+
+                t = (
+                    0.0
+                    if denom < 1e-12
+                    else np.clip(np.dot(point - a, ab) / denom, 0.0, 1.0)
+                )
+
+                proj = a + t * ab
+
+                dist = np.linalg.norm(point - proj)
+
+                if dist < best_dist:
+                    best_dist = dist
+                    best_seg = i
+
+            insert_at = best_seg + 1
+
+            curve.insert(insert_at, point)
+
+            inserted_indices[original_order] = insert_at
+
+            for k in range(len(points_to_insert)):
+
+                if (
+                    inserted_indices[k] is not None
+                    and k != original_order
+                    and inserted_indices[k] >= insert_at
+                ):
+
+                    inserted_indices[k] += 1
+
+        return np.asarray(curve), inserted_indices
 
 
-        print(
-            f"Intersection points : "
-            f"{section.n_points:,}"
+    # ============================================================
+    # 10. EXTRACT CURVES FROM SECTION
+    # ============================================================
+
+    def extract_curves(section):
+
+        lines = section.lines
+
+        if lines is None or len(lines) == 0:
+            return []
+
+        lines = lines.reshape(
+            -1,
+            3
         )
 
+        edges = []
 
-        curves = extract_curves(
-            section
-        )
+        for _, a, b in lines:
+
+            a = int(a)
+            b = int(b)
+
+            if a != b:
+
+                edges.append(
+                    (a, b)
+                )
 
 
-        print(
-            f"Curves detected : "
-            f"{len(curves)}"
-        )
+        # --------------------------------------------------------
+        # Build graph
+        # --------------------------------------------------------
+
+        neighbors = {}
+
+        for a, b in edges:
+
+            neighbors.setdefault(
+                a,
+                []
+            ).append(b)
+
+            neighbors.setdefault(
+                b,
+                []
+            ).append(a)
 
 
-        section_curves = []
+        # --------------------------------------------------------
+        # Find endpoints
+        # --------------------------------------------------------
+
+        endpoints = [
+            node
+            for node, neigh
+            in neighbors.items()
+            if len(neigh) == 1
+        ]
 
 
-        # ------------------------------------------------------
-        # Analyse curves
-        # ------------------------------------------------------
+        # --------------------------------------------------------
+        # Follow paths
+        # --------------------------------------------------------
+
+        def follow(start):
+
+            # ------------------------------------------------------
+            # A un pli / defaut de surface, plusieurs aretes se
+            # rejoignent parfois au meme point (noeud "en branche",
+            # non filaire). Prendre arbitrairement la premiere
+            # branche coupait la courbe en plein milieu. On choisit
+            # ici la branche qui prolonge le plus "tout droit" la
+            # direction deja suivie, ce qui reste sur le bon trajet
+            # meme au niveau d'un pli.
+            # ------------------------------------------------------
+
+            path = []
+
+            current = start
+            previous = None
+
+            while True:
+
+                path.append(
+                    current
+                )
+
+                possible = [
+                    n
+                    for n in neighbors[current]
+                    if n != previous
+                    and n not in path
+                ]
+
+                if not possible:
+                    break
+
+                if len(possible) == 1 or previous is None:
+
+                    current, previous = possible[0], current
+
+                else:
+
+                    prev_dir = (
+                        section.points[current]
+                        -
+                        section.points[previous]
+                    )
+
+                    prev_norm = np.linalg.norm(prev_dir)
+
+                    if prev_norm > 1e-12:
+                        prev_dir = prev_dir / prev_norm
+
+                    best_candidate = None
+                    best_score = -np.inf
+
+                    for candidate in possible:
+
+                        cand_dir = (
+                            section.points[candidate]
+                            -
+                            section.points[current]
+                        )
+
+                        cand_norm = np.linalg.norm(cand_dir)
+
+                        if cand_norm > 1e-12:
+                            cand_dir = cand_dir / cand_norm
+
+                        # score proche de 1 = continuation en ligne
+                        # droite, proche de -1 = demi-tour
+                        score = np.dot(prev_dir, cand_dir)
+
+                        if score > best_score:
+                            best_score = score
+                            best_candidate = candidate
+
+                    current, previous = best_candidate, current
+
+            return path
+
+
+        paths = []
+
+        used = set()
+
+
+        # Open curves first
+        for start in endpoints:
+
+            if start in used:
+                continue
+
+            path = follow(start)
+
+            for node in path:
+                used.add(node)
+
+            if len(path) >= 4:
+
+                paths.append(
+                    path
+                )
+
+
+        # Remaining curves
+        remaining = [
+            n
+            for n in neighbors
+            if n not in used
+        ]
+
+        for start in remaining:
+
+            if start in used:
+                continue
+
+            path = follow(start)
+
+            for node in path:
+                used.add(node)
+
+            if len(path) >= 4:
+
+                paths.append(
+                    path
+                )
+
+
+        curves = []
+
+        for path in paths:
+
+            curves.append(
+                section.points[path]
+            )
+
+
+        # --------------------------------------------------------
+        # Stitch fragments broken by folds / scan defects
         #
-        # No A x B intersection point is forced into a curve at
-        # this stage anymore. Doing so before smoothing/fitting
-        # imposed a rigid boundary condition that the rest of the
-        # curve then had to bend around, and a second forced
-        # snap right before export undid whatever shape smoothing
-        # had settled into -- both visible as kinks/twisting.
-        # Curves are now smoothed and (optionally) reconstructed
-        # completely on their own terms; the two curve families
-        # are only brought together at the very end, once both
-        # are in their final shape (see step 13bis).
+        # A pli or a small mesh defect can genuinely leave two
+        # separate line fragments in the graph (no shared vertex)
+        # even though the surface is continuous. If two fragment
+        # endpoints are spatially close (< STITCH_TOLERANCE_MM),
+        # they are almost certainly the same curve and are merged.
+        # --------------------------------------------------------
 
-        for curve_number, curve in enumerate(
+        curves = stitch_curve_fragments(
             curves,
+            STITCH_TOLERANCE_MM
+        )
+
+
+        # --------------------------------------------------------
+        # Discard short curves (noise loops / islands)
+        # --------------------------------------------------------
+
+        filtered_curves = []
+
+        for c in curves:
+
+            curve_length = np.sum(
+                np.linalg.norm(
+                    np.diff(c, axis=0),
+                    axis=1
+                )
+            ) if len(c) >= 2 else 0.0
+
+            if curve_length >= MIN_CURVE_LENGTH_MM:
+
+                filtered_curves.append(c)
+
+        return filtered_curves
+
+
+    # ============================================================
+    # 11. EXTRACT ALL SECTIONS (for one cutting direction)
+    # ============================================================
+    #
+    # This is called once per cutting plane (A and B), each with
+    # its own origin point, normal, in-plane basis (u, v), width
+    # and section count. A single family of parallel sections in
+    # only one direction is not enough to constrain a Loft/Boundary
+    # Surface well (it only has cross-sections one way); running
+    # this twice, once per perpendicular plane, produces a proper
+    # two-direction curve network (like stations + buttock lines in
+    # hull lofting) for SolidWorks to loft against in both
+    # directions.
+
+    def extract_all_sections_for_direction(
+        direction_label,
+        direction_origin_point,
+        direction_normal,
+        direction_u,
+        direction_v,
+        direction_width,
+        direction_count
+    ):
+
+        direction_offsets = np.linspace(
+            -direction_width / 2,
+            direction_width / 2,
+            direction_count
+        )
+
+        direction_data = []
+
+        for section_number, offset in enumerate(
+            direction_offsets,
             start=1
         ):
 
-            length = 0.0
+            print()
+            print("--------------------------------------")
 
-            for i in range(
-                1,
-                len(curve)
-            ):
+            print(
+                f"PLANE {direction_label} - SECTION "
+                f"{section_number}/{direction_count}"
+            )
 
-                length += np.linalg.norm(
-                    curve[i]
-                    -
-                    curve[i - 1]
+            print(
+                f"Offset = {offset:+.2f} mm"
+            )
+
+
+            origin = (
+                direction_origin_point
+                +
+                offset * direction_normal
+            )
+
+
+            section = mesh.slice(
+                normal=direction_normal,
+                origin=origin
+            )
+
+            section = section.clean()
+
+
+            if section.n_points == 0:
+
+                print(
+                    "No intersection."
                 )
+
+                continue
 
 
             print(
-                f"  Curve {curve_number}: "
-                f"{len(curve):,} points, "
-                f"length = {length:.2f} mm"
+                f"Intersection points : "
+                f"{section.n_points:,}"
             )
 
 
-            # ----------------------------------------------------
-            # Smooth (removes zigzags from scan noise / folds)
-            # ----------------------------------------------------
-
-            curve_smoothed = smooth_curve(
-                curve,
-                iterations=smoothing_strength
+            curves = extract_curves(
+                section
             )
 
 
-            # ----------------------------------------------------
-            # Ideal curve fitting (optional, off by default):
-            # replaces local fold dents with one smooth continuous
-            # curve, for soft/deformable objects.
-            # ----------------------------------------------------
-
-            curve_smoothed, _ = fit_ideal_curve(
-                curve_smoothed,
-                strength=ideal_curve_strength,
-                avg_edge_length=AVG_EDGE_LENGTH
+            print(
+                f"Curves detected : "
+                f"{len(curves)}"
             )
 
 
-            # ----------------------------------------------------
-            # Project into 2D (this direction's own basis)
-            # ----------------------------------------------------
+            section_curves = []
 
-            curve_2d = []
 
-            for point in curve_smoothed:
+            # ------------------------------------------------------
+            # Analyse curves
+            # ------------------------------------------------------
+            #
+            # No A x B intersection point is forced into a curve at
+            # this stage anymore. Doing so before smoothing/fitting
+            # imposed a rigid boundary condition that the rest of the
+            # curve then had to bend around, and a second forced
+            # snap right before export undid whatever shape smoothing
+            # had settled into -- both visible as kinks/twisting.
+            # Curves are now smoothed and (optionally) reconstructed
+            # completely on their own terms; the two curve families
+            # are only brought together at the very end, once both
+            # are in their final shape (see step 13bis).
 
-                x = np.dot(
-                    point - origin,
-                    direction_u
+            for curve_number, curve in enumerate(
+                curves,
+                start=1
+            ):
+
+                length = 0.0
+
+                for i in range(
+                    1,
+                    len(curve)
+                ):
+
+                    length += np.linalg.norm(
+                        curve[i]
+                        -
+                        curve[i - 1]
+                    )
+
+
+                print(
+                    f"  Curve {curve_number}: "
+                    f"{len(curve):,} points, "
+                    f"length = {length:.2f} mm"
                 )
 
-                y = np.dot(
-                    point - origin,
-                    direction_v
+
+                # ----------------------------------------------------
+                # Smooth (removes zigzags from scan noise / folds)
+                # ----------------------------------------------------
+
+                curve_smoothed = smooth_curve(
+                    curve,
+                    iterations=smoothing_strength
                 )
 
-                curve_2d.append(
-                    [x, y]
+
+                # ----------------------------------------------------
+                # Ideal curve fitting (optional, off by default):
+                # replaces local fold dents with one smooth continuous
+                # curve, for soft/deformable objects.
+                # ----------------------------------------------------
+
+                curve_smoothed, _ = fit_ideal_curve(
+                    curve_smoothed,
+                    strength=ideal_curve_strength,
+                    avg_edge_length=AVG_EDGE_LENGTH
                 )
 
 
-            section_curves.append(
+                # ----------------------------------------------------
+                # Project into 2D (this direction's own basis)
+                # ----------------------------------------------------
+
+                curve_2d = []
+
+                for point in curve_smoothed:
+
+                    x = np.dot(
+                        point - origin,
+                        direction_u
+                    )
+
+                    y = np.dot(
+                        point - origin,
+                        direction_v
+                    )
+
+                    curve_2d.append(
+                        [x, y]
+                    )
+
+
+                section_curves.append(
+                    {
+                        "points_2d": np.asarray(curve_2d),
+                        "points_3d": np.asarray(curve_smoothed),
+                        "length": length
+                    }
+                )
+
+
+            # --------------------------------------------------------
+            # Identify main curve (longest curve of the section)
+            # --------------------------------------------------------
+
+            main_curve_index = None
+
+            if section_curves:
+
+                main_curve_index = max(
+                    range(len(section_curves)),
+                    key=lambda i: section_curves[i]["length"]
+                )
+
+                print(
+                    f"  -> Main curve = Curve "
+                    f"{main_curve_index + 1} "
+                    f"({section_curves[main_curve_index]['length']:.2f} mm)"
+                )
+
+            else:
+
+                print(
+                    "  -> No curve detected for this section."
+                )
+
+
+            direction_data.append(
                 {
-                    "points_2d": np.asarray(curve_2d),
-                    "points_3d": np.asarray(curve_smoothed),
-                    "length": length
+                    "direction": direction_label,
+                    "number": section_number,
+                    "offset": offset,
+                    "origin": origin,
+                    "u": direction_u,
+                    "v": direction_v,
+                    "curves": section_curves,
+                    "main_curve_index": main_curve_index
                 }
             )
 
+        return direction_data
 
-        # --------------------------------------------------------
-        # Identify main curve (longest curve of the section)
-        # --------------------------------------------------------
-
-        main_curve_index = None
-
-        if section_curves:
-
-            main_curve_index = max(
-                range(len(section_curves)),
-                key=lambda i: section_curves[i]["length"]
-            )
-
-            print(
-                f"  -> Main curve = Curve "
-                f"{main_curve_index + 1} "
-                f"({section_curves[main_curve_index]['length']:.2f} mm)"
-            )
-
-        else:
-
-            print(
-                "  -> No curve detected for this section."
-            )
-
-
-        direction_data.append(
-            {
-                "direction": direction_label,
-                "number": section_number,
-                "offset": offset,
-                "origin": origin,
-                "u": direction_u,
-                "v": direction_v,
-                "curves": section_curves,
-                "main_curve_index": main_curve_index
-            }
-        )
-
-    return direction_data
-
-
-print()
-print("======================================")
-print("EXTRACTING PLANE A SECTIONS")
-print("======================================")
-
-all_section_data_a = extract_all_sections_for_direction(
-    "A",
-    p1,
-    normal_a,
-    u_a,
-    v_a,
-    width_a,
-    number_of_sections_a
-)
-
-all_section_data_b = []
-
-if use_plane_b:
 
     print()
     print("======================================")
-    print("EXTRACTING PLANE B SECTIONS")
+    print("EXTRACTING PLANE A SECTIONS")
     print("======================================")
 
-    all_section_data_b = extract_all_sections_for_direction(
-        "B",
+    all_section_data_a = extract_all_sections_for_direction(
+        "A",
         p1,
-        normal_b,
-        u_b,
-        v_b,
-        width_b,
-        number_of_sections_b
+        normal_a,
+        u_a,
+        v_a,
+        width_a,
+        number_of_sections_a
     )
 
-all_section_data = all_section_data_a + all_section_data_b
+    all_section_data_b = []
 
-# Snapshot every main curve's full-resolution shape right here,
-# before either reconstruction method can touch it. Method 2 (see
-# step 11bis below) replaces curve_info["points_3d"] with a minimal
-# "start + intersections + end" polyline so that curve A_i and
-# curve B_j meet at an exact shared point -- but that also throws
-# away the actual scanned shape BETWEEN those intersections. Surface
-# reconstruction (step 14) needs the real, richly-sampled curve for
-# its cell edges -- using the post-rebuild version produced flat,
-# near-planar cells instead of surfaces following the scan -- so it
-# is given this snapshot instead of all_section_data's own (possibly
-# later-simplified) points_3d.
-rich_main_curves = {}
+    if use_plane_b:
 
-for data in all_section_data:
+        print()
+        print("======================================")
+        print("EXTRACTING PLANE B SECTIONS")
+        print("======================================")
 
-    main_index = data["main_curve_index"]
-
-    if main_index is not None:
-
-        rich_main_curves[(data["direction"], data["number"])] = np.array(
-            data["curves"][main_index]["points_3d"],
-            dtype=float
+        all_section_data_b = extract_all_sections_for_direction(
+            "B",
+            p1,
+            normal_b,
+            u_b,
+            v_b,
+            width_b,
+            number_of_sections_b
         )
 
-# The scanned patch's outline: a closed loop through the ordered
-# open endpoints of every A/B curve, built from the same
-# full-resolution snapshot above rather than a possibly-simplified
-# curve. Computed once here so it can be included both in
-# sections_main_3d.dxf (step 13.3) and its own boundary_loop.dxf
-# (step 13.5), and reused by surface reconstruction later.
-boundary_loop_points = (
-    order_boundary_loop(collect_curve_endpoints(rich_main_curves))
-    if len(rich_main_curves) >= 3
-    else None
-)
+    all_section_data = all_section_data_a + all_section_data_b
 
-# --------------------------------------------------------
-# 12bis. EXCLUDE SECTIONS FROM THE RECONSTRUCTED SURFACE
-#        (optional, click-based)
-# --------------------------------------------------------
-#
-# A real hole/gap in the object (a strap adjustment slot, a vent)
-# isn't scan noise, but it does break the "one simple closed
-# boundary" assumption the surface step relies on -- the boundary
-# loop and the surface itself can both get dragged into a bad shape
-# right at that hole. Which section(s) cross it can only really be
-# told apart by SEEING them (a section number alone means nothing
-# without the picture), so this is a click window, not a typed list.
-# Excluded sections stay in every DXF export as usual (see
-# rich_main_curves/boundary_loop_points above); only this separate
-# surface_main_curves view, used for surface reconstruction below,
-# leaves them out.
+    # Snapshot every main curve's full-resolution shape right here,
+    # before either reconstruction method can touch it. Method 2 (see
+    # step 11bis below) replaces curve_info["points_3d"] with a minimal
+    # "start + intersections + end" polyline so that curve A_i and
+    # curve B_j meet at an exact shared point -- but that also throws
+    # away the actual scanned shape BETWEEN those intersections. Surface
+    # reconstruction (step 14) needs the real, richly-sampled curve for
+    # its cell edges -- using the post-rebuild version produced flat,
+    # near-planar cells instead of surfaces following the scan -- so it
+    # is given this snapshot instead of all_section_data's own (possibly
+    # later-simplified) points_3d.
+    rich_main_curves = {}
 
-excluded_from_surface = set()
+    for data in all_section_data:
 
-if use_plane_b and len(rich_main_curves) >= 3:
+        main_index = data["main_curve_index"]
 
-    print()
-    print("======================================")
-    print("EXCLUDE SECTIONS FROM SURFACE (optional)")
-    print("======================================")
+        if main_index is not None:
 
-    print(
-        "Click a curve to exclude it from the reconstructed surface\n"
-        "-- e.g. one crossing a real hole/gap in the object, like a\n"
-        "strap adjustment slot, rather than scan noise. Click again\n"
-        "to re-include it. Excluded curves turn dim/thin; every DXF\n"
-        "export still includes them as usual. Close the window when\n"
-        "done (no clicks = use every section)."
-    )
-
-    exclude_colors = [
-        "red", "blue", "green", "orange", "purple",
-        "cyan", "magenta", "brown"
-    ]
-
-    exclude_plotter = pv.Plotter(
-        window_size=(1500, 950)
-    )
-
-    exclude_plotter.add_mesh(
-        mesh,
-        color="lightgray",
-        opacity=0.12,
-        show_edges=False
-    )
-
-    exclude_plotter.add_text(
-        "EXCLUDE SECTIONS - click a curve to leave it out of the "
-        "surface (optional)",
-        position="upper_left",
-        font_size=16
-    )
-
-    exclude_actor_map = {}
-
-    for curve_index, key in enumerate(sorted(rich_main_curves.keys())):
-
-        points = rich_main_curves[key]
-
-        if len(points) < 2:
-            continue
-
-        color = exclude_colors[curve_index % len(exclude_colors)]
-
-        line = pv.lines_from_points(
-            points,
-            close=False
-        )
-
-        actor = exclude_plotter.add_mesh(
-            line,
-            color=color,
-            line_width=4,
-            name=f"exclude_curve_{key[0]}{key[1]}"
-        )
-
-        exclude_actor_map[actor] = {
-            "key": key,
-            "default_color": color
-        }
-
-        exclude_plotter.add_point_labels(
-            np.array([points[len(points) // 2]]),
-            [f"{key[0]}{key[1]}"],
-            point_size=1,
-            font_size=14,
-            shape=None,
-            name=f"exclude_label_{key[0]}{key[1]}"
-        )
-
-    exclude_picker = vtk.vtkCellPicker()
-    exclude_picker.SetTolerance(0.005)
-    exclude_picker.PickFromListOn()
-
-    for actor in exclude_actor_map:
-        exclude_picker.AddPickList(actor)
-
-    def exclude_click(caller, event):
-
-        x, y = caller.GetEventPosition()
-
-        exclude_picker.Pick(
-            x,
-            y,
-            0,
-            exclude_plotter.renderer
-        )
-
-        actor = exclude_picker.GetActor()
-
-        if actor is None or actor not in exclude_actor_map:
-            return
-
-        info = exclude_actor_map[actor]
-        key = info["key"]
-
-        if key in excluded_from_surface:
-
-            excluded_from_surface.discard(key)
-
-            actor.prop.color = info["default_color"]
-            actor.prop.line_width = 4
-            actor.prop.opacity = 1.0
-
-            print(f"  {key[0]}{key[1]}: re-included")
-
-        else:
-
-            excluded_from_surface.add(key)
-
-            actor.prop.color = "black"
-            actor.prop.line_width = 1
-            actor.prop.opacity = 0.3
-
-            print(f"  {key[0]}{key[1]}: excluded")
-
-        exclude_plotter.render()
-
-    exclude_plotter.iren.add_observer(
-        "LeftButtonPressEvent",
-        exclude_click
-    )
-
-    exclude_plotter.add_axes()
-
-    exclude_plotter.show()
-
-    if excluded_from_surface:
-
-        print(
-            "  Excluded from surface: "
-            + ", ".join(
-                f"{d}{n}" for d, n in sorted(excluded_from_surface)
+            rich_main_curves[(data["direction"], data["number"])] = np.array(
+                data["curves"][main_index]["points_3d"],
+                dtype=float
             )
-        )
 
-    else:
-
-        print("  No sections excluded.")
-
-
-# A separate view of the curve set with the excluded sections left
-# out, used ONLY for surface reconstruction below. The DXF exports
-# above (including boundary_loop.dxf) still use the full, unfiltered
-# rich_main_curves, so excluded sections stay visible there for
-# reference/diagnosis.
-surface_main_curves = {
-    key: points
-    for key, points in rich_main_curves.items()
-    if key not in excluded_from_surface
-}
-
-surface_boundary_loop_points = (
-    order_boundary_loop(collect_curve_endpoints(surface_main_curves))
-    if len(surface_main_curves) >= 3
-    else None
-)
-
-
-# ============================================================
-# 12ter. SEPARATE INTO PANELS (optional)
-# ============================================================
-#
-# A single global surface asks one B-spline to reconcile every
-# region's curvature at once -- confirmed as the direct cause of a
-# real SolidWorks import failure ("no geometry data"): the fitted
-# surface's own boundary edge ended up 14-33mm off from the requested
-# boundary loop, regardless of smoothing tolerance, because a single
-# degree-8 fit couldn't reconcile a cap's near-flat visor and domed
-# crown at once (BRep_Tool.Tolerance_s on the built edge, confirmed
-# directly -- and neither ShapeFix_Shape nor BRepLib.SameParameter_s
-# could shrink it, since the gap is a real geometric fact, not a
-# stale tolerance flag). Tracing a seam here (e.g. where the visor
-# meets the crown) splits the patch into simpler, individually
-# better-behaved surfaces instead -- see
-# curve_utils.split_into_panels. Any number of seams can be traced,
-# each further subdividing whichever ONE panel (of everything split
-# off so far) its own two ends land within -- see the README.
-
-separator_lines = []
-current_separator_line = []
-
-if use_plane_b and surface_boundary_loop_points is not None:
-
-    print()
-    print("======================================")
-    print("SEPARATE INTO PANELS (optional)")
-    print("======================================")
-
-    print(
-        "Click a sequence of points along a seam on the mesh (e.g.\n"
-        "where a cap's visor meets its crown), both ends near the\n"
-        "outer edge, to reconstruct that region as its own simpler\n"
-        "surface instead of one surface for everything. Press 'n' to\n"
-        "finish the current seam and start another one -- each seam\n"
-        "must stay within a single existing panel (trace the\n"
-        "crown/visor seam first; a seam splitting off another panel\n"
-        "has to be traced within one of the results, not across two\n"
-        "already-split panels). Close the window when done (no\n"
-        "clicks, or just one point, = one single surface, as usual)."
+    # The scanned patch's outline: a closed loop through the ordered
+    # open endpoints of every A/B curve, built from the same
+    # full-resolution snapshot above rather than a possibly-simplified
+    # curve. Computed once here so it can be included both in
+    # sections_main_3d.dxf (step 13.3) and its own boundary_loop.dxf
+    # (step 13.5), and reused by surface reconstruction later.
+    boundary_loop_points = (
+        order_boundary_loop(collect_curve_endpoints(rich_main_curves))
+        if len(rich_main_curves) >= 3
+        else None
     )
 
-    separator_plotter = pv.Plotter(
-        window_size=(1500, 950)
-    )
+    # --------------------------------------------------------
+    # 12bis. EXCLUDE SECTIONS FROM THE RECONSTRUCTED SURFACE
+    #        (optional, click-based)
+    # --------------------------------------------------------
+    #
+    # A real hole/gap in the object (a strap adjustment slot, a vent)
+    # isn't scan noise, but it does break the "one simple closed
+    # boundary" assumption the surface step relies on -- the boundary
+    # loop and the surface itself can both get dragged into a bad shape
+    # right at that hole. Which section(s) cross it can only really be
+    # told apart by SEEING them (a section number alone means nothing
+    # without the picture), so this is a click window, not a typed list.
+    # Excluded sections stay in every DXF export as usual (see
+    # rich_main_curves/boundary_loop_points above); only this separate
+    # surface_main_curves view, used for surface reconstruction below,
+    # leaves them out.
 
-    separator_plotter.add_mesh(
-        mesh,
-        color="lightgray",
-        opacity=0.5
-    )
+    excluded_from_surface = set()
 
-    separator_plotter.add_text(
-        "SEPARATE INTO PANELS - click points along a seam, both ends "
-        "near the outer edge. Press 'n' for another seam (optional)",
-        position="upper_left",
-        font_size=16
-    )
+    if use_plane_b and len(rich_main_curves) >= 3:
 
-    separator_colors = [
-        "yellow", "cyan", "magenta", "orange", "lime", "red"
-    ]
-
-    separator_picker = vtk.vtkCellPicker()
-    separator_picker.SetTolerance(0.001)
-
-    def separator_click(caller, event):
-
-        x, y = caller.GetEventPosition()
-
-        separator_picker.Pick(
-            x,
-            y,
-            0,
-            separator_plotter.renderer
-        )
-
-        if separator_picker.GetCellId() < 0:
-            print("No surface detected.")
-            return
-
-        point = np.array(
-            separator_picker.GetPickPosition()
-        )
-
-        current_separator_line.append(point)
+        print()
+        print("======================================")
+        print("EXCLUDE SECTIONS FROM SURFACE (optional)")
+        print("======================================")
 
         print(
-            f"  Seam {len(separator_lines) + 1}, point "
-            f"{len(current_separator_line)}: X={point[0]:.4f}, "
-            f"Y={point[1]:.4f}, Z={point[2]:.4f}"
+            "Click a curve to exclude it from the reconstructed surface\n"
+            "-- e.g. one crossing a real hole/gap in the object, like a\n"
+            "strap adjustment slot, rather than scan noise. Click again\n"
+            "to re-include it. Excluded curves turn dim/thin; every DXF\n"
+            "export still includes them as usual. Close the window when\n"
+            "done (no clicks = use every section)."
         )
 
-        color = separator_colors[
-            len(separator_lines) % len(separator_colors)
+        exclude_colors = [
+            "red", "blue", "green", "orange", "purple",
+            "cyan", "magenta", "brown"
         ]
 
-        if len(current_separator_line) >= 2:
+        exclude_plotter = pv.Plotter(
+            window_size=(1500, 950)
+        )
+
+        exclude_plotter.add_mesh(
+            mesh,
+            color="lightgray",
+            opacity=0.12,
+            show_edges=False
+        )
+
+        exclude_plotter.add_text(
+            "EXCLUDE SECTIONS - click a curve to leave it out of the "
+            "surface (optional)",
+            position="upper_left",
+            font_size=16
+        )
+
+        exclude_actor_map = {}
+
+        for curve_index, key in enumerate(sorted(rich_main_curves.keys())):
+
+            points = rich_main_curves[key]
+
+            if len(points) < 2:
+                continue
+
+            color = exclude_colors[curve_index % len(exclude_colors)]
 
             line = pv.lines_from_points(
-                np.array(current_separator_line),
+                points,
                 close=False
             )
 
-            separator_plotter.add_mesh(
+            actor = exclude_plotter.add_mesh(
                 line,
                 color=color,
-                line_width=5,
-                name=f"separator_line_{len(separator_lines)}"
+                line_width=4,
+                name=f"exclude_curve_{key[0]}{key[1]}"
             )
 
-        marker = pv.PolyData(
-            point.reshape(1, 3)
-        )
+            exclude_actor_map[actor] = {
+                "key": key,
+                "default_color": color
+            }
 
-        separator_plotter.add_mesh(
-            marker,
-            color=color,
-            point_size=14,
-            render_points_as_spheres=True,
-            name=(
-                f"separator_point_{len(separator_lines)}_"
-                f"{len(current_separator_line)}"
+            exclude_plotter.add_point_labels(
+                np.array([points[len(points) // 2]]),
+                [f"{key[0]}{key[1]}"],
+                point_size=1,
+                font_size=14,
+                shape=None,
+                name=f"exclude_label_{key[0]}{key[1]}"
             )
+
+        exclude_picker = vtk.vtkCellPicker()
+        exclude_picker.SetTolerance(0.005)
+        exclude_picker.PickFromListOn()
+
+        for actor in exclude_actor_map:
+            exclude_picker.AddPickList(actor)
+
+        def exclude_click(caller, event):
+
+            x, y = caller.GetEventPosition()
+
+            exclude_picker.Pick(
+                x,
+                y,
+                0,
+                exclude_plotter.renderer
+            )
+
+            actor = exclude_picker.GetActor()
+
+            if actor is None or actor not in exclude_actor_map:
+                return
+
+            info = exclude_actor_map[actor]
+            key = info["key"]
+
+            if key in excluded_from_surface:
+
+                excluded_from_surface.discard(key)
+
+                actor.prop.color = info["default_color"]
+                actor.prop.line_width = 4
+                actor.prop.opacity = 1.0
+
+                print(f"  {key[0]}{key[1]}: re-included")
+
+            else:
+
+                excluded_from_surface.add(key)
+
+                actor.prop.color = "black"
+                actor.prop.line_width = 1
+                actor.prop.opacity = 0.3
+
+                print(f"  {key[0]}{key[1]}: excluded")
+
+            exclude_plotter.render()
+
+        exclude_plotter.iren.add_observer(
+            "LeftButtonPressEvent",
+            exclude_click
         )
 
-        separator_plotter.render()
+        exclude_plotter.add_axes()
 
-    def separator_next_line():
+        exclude_plotter.show()
 
-        if len(current_separator_line) >= 2:
-
-            separator_lines.append(list(current_separator_line))
+        if excluded_from_surface:
 
             print(
-                f"  Seam {len(separator_lines)} finished "
-                f"({len(current_separator_line)} points)."
+                "  Excluded from surface: "
+                + ", ".join(
+                    f"{d}{n}" for d, n in sorted(excluded_from_surface)
+                )
             )
-
-            current_separator_line.clear()
 
         else:
 
-            print(
-                "  Need at least 2 points before starting another "
-                "seam -- ignored."
-            )
-
-    separator_plotter.iren.add_observer(
-        "LeftButtonPressEvent",
-        separator_click
-    )
-
-    separator_plotter.add_key_event("n", separator_next_line)
-
-    separator_plotter.add_axes()
-
-    separator_plotter.show()
-
-    if len(current_separator_line) >= 2:
-
-        separator_lines.append(list(current_separator_line))
-
-        print(
-            f"  Seam {len(separator_lines)} finished "
-            f"({len(current_separator_line)} points)."
-        )
-
-    if separator_lines:
-        print(f"  {len(separator_lines)} seam(s) traced.")
-    else:
-        print("  No seam traced -- using one single surface.")
-
-if surface_boundary_loop_points is None:
-
-    surface_regions = []
-
-elif separator_lines:
-
-    surface_regions, skipped_seams = split_into_panels(
-        surface_boundary_loop_points,
-        surface_main_curves,
-        [np.array(line) for line in separator_lines]
-    )
-
-    for seam_index, reason in skipped_seams:
-
-        print(
-            f"  Seam {seam_index + 1} could not be applied and was "
-            f"skipped -- {reason}"
-        )
-
-else:
-
-    surface_regions = [{
-        "boundary_loop": surface_boundary_loop_points,
-        "interior_curves": list(surface_main_curves.values())
-    }]
-
-
-# ============================================================
-# 12quater. FIND A x B INTERSECTIONS ON THE FINAL CURVES
-# ============================================================
-#
-# Curves have now been smoothed and (optionally) reconstructed
-# completely on their own terms, with no intersection-related
-# constraint at all. For every plane pair validated in step
-# 5bis, this looks for that many distinct closest-approach
-# locations between the FINAL curve A_i and the FINAL curve B_j
-# -- purely to FIND and RECORD where the two curve families
-# already meet (or nearly meet), for reference (see the
-# intersection markers exported in step 13.4).
-#
-# Nothing here modifies the curves. Snapping the two closest
-# points to a shared midpoint was tried, but even a small nudge
-# repeated at every crossing along a curve that has many of them
-# (a single A-curve can cross a dozen+ B-curves) reintroduces
-# exactly the small kinks/twisting this was meant to avoid --
-# the curves are already extremely close at these locations
-# (typically well under a millimetre) precisely because both
-# were independently smoothed from the same underlying surface,
-# so forcing them together adds distortion without adding real
-# accuracy.
-
-
-def find_all_intersections(all_section_data, plane_intersections):
-    """
-    For every plane pair validated in step 5bis, looks for that
-    many distinct closest-approach locations between the CURRENT
-    curve A_i and curve B_j (whatever state they are in when this
-    is called). Returns a list of
-    {"pair_id": (i, j, k), "point": ..., "gap": ...,
-    "idx_a": ..., "idx_b": ...} where idx_a/idx_b are the point
-    indices, along curve A_i's and B_j's own points_3d array,
-    where the crossing sits -- used downstream to cut each curve
-    into segments at its crossings for surface reconstruction
-    (see curve_utils.segment_curve_at_indices).
-    Does not modify any curve.
-    """
-
-    crossing_max_gap_mm = (
-        CROSSING_MAX_GAP_FACTOR
-        *
-        AVG_EDGE_LENGTH
-    )
-
-    curves_by_key = {}
-
-    for data in all_section_data:
-
-        main_index = data["main_curve_index"]
-
-        if main_index is None:
-            continue
-
-        curves_by_key[(data["direction"], data["number"])] = (
-            data,
-            data["curves"][main_index]
-        )
-
-    results = []
-
-    for (i, j), hit_list in plane_intersections.items():
-
-        key_a = ("A", i)
-        key_b = ("B", j)
-
-        if key_a not in curves_by_key or key_b not in curves_by_key:
-            continue
-
-        _, curve_info_a = curves_by_key[key_a]
-        _, curve_info_b = curves_by_key[key_b]
-
-        pts_a = curve_info_a["points_3d"]
-        pts_b = curve_info_b["points_3d"]
-
-        if len(pts_a) < 2 or len(pts_b) < 2:
-            continue
-
-        expected_count = len(hit_list)
-
-        crossings = find_curve_crossings(
-            pts_a,
-            pts_b,
-            max_count=expected_count,
-            max_gap=crossing_max_gap_mm
-        )
-
-        if expected_count > 1:
-
-            print(
-                f"  {('A', i)} x {('B', j)}: "
-                f"{expected_count} crossing(s) expected, "
-                f"{len(crossings)} found"
-            )
-
-        for k, (idx_a, idx_b, gap) in enumerate(crossings):
-
-            reference_point = (
-                pts_a[idx_a] + pts_b[idx_b]
-            ) / 2.0
-
-            results.append(
-                {
-                    "pair_id": (i, j, k),
-                    "point": reference_point,
-                    "gap": gap,
-                    "idx_a": int(idx_a),
-                    "idx_b": int(idx_b)
-                }
-            )
-
-    return results
-
-
-CROSSING_MAX_GAP_FACTOR = 10.0
-
-# Initialised once, here, before either reconstruction method
-# runs: method 2 fills this in directly below (it needs the
-# intersections anyway to build its curves); method 1 fills it
-# in later, after the interactive correction step, purely for
-# reporting (see the end of step 12).
-found_intersections = []
-
-
-# ============================================================
-# 11bis. SIMPLE SPLINE THROUGH INTERSECTIONS (method 2)
-# ============================================================
-#
-# Alternative to the interactive polynomial method (still
-# available as method 1, see step 12). Here, every A x B
-# crossing is found FIRST, directly on the smoothed curves --
-# then each main curve is entirely replaced by a minimal curve
-# through just its two endpoints and its own intersection
-# points, in order along the curve. Since curve A_i and curve
-# B_j both get the EXACT SAME point object at a shared crossing,
-# and both are exported as interpolating splines (fit_points),
-# SolidWorks sees a true, formal intersection there -- not two
-# curves merely passing close to each other. The trade-off: the
-# curve no longer hugs the scanned shape between those points,
-# only a smooth spline through them.
-
-if use_plane_b and reconstruction_method == 2:
-
-    print()
-    print("======================================")
-    print("SIMPLE SPLINE THROUGH INTERSECTIONS")
-    print("======================================")
-
-    found_intersections = find_all_intersections(
-        all_section_data,
-        plane_intersections
-    )
-
-    per_curve_points = {}
-
-    for entry in found_intersections:
-
-        i, j, _ = entry["pair_id"]
-
-        point = entry["point"]
-
-        per_curve_points.setdefault(("A", i), []).append(point)
-        per_curve_points.setdefault(("B", j), []).append(point)
-
-    rebuilt_count = 0
-
-    for data in all_section_data:
-
-        main_index = data["main_curve_index"]
-
-        if main_index is None:
-            continue
-
-        curve_info = data["curves"][main_index]
-
-        assigned = per_curve_points.get(
-            (data["direction"], data["number"]),
-            []
-        )
-
-        if not assigned:
-            continue
-
-        new_points_3d = build_simple_spline_curve(
-            curve_info["points_3d"],
-            assigned
-        )
-
-        origin = data["origin"]
-        local_u = data["u"]
-        local_v = data["v"]
-
-        new_points_2d = np.array(
-            [
-                [
-                    np.dot(point - origin, local_u),
-                    np.dot(point - origin, local_v)
-                ]
-                for point in new_points_3d
-            ]
-        )
-
-        curve_info["points_3d"] = new_points_3d
-        curve_info["points_2d"] = new_points_2d
-
-        rebuilt_count += 1
-
-    print(
-        f"  {len(found_intersections)} intersection point(s) "
-        f"found; {rebuilt_count} curve(s) rebuilt as a simple "
-        f"spline through their endpoints + intersections."
-    )
-
-
-# ============================================================
-# 12. SECTION PREVIEW + OPTIONAL PIECEWISE RECONSTRUCTION
-#     (method 1 only)
-# ============================================================
-#
-# This entire interactive step only applies to reconstruction
-# method 1. Method 2 already gave every main curve its final,
-# exact shape in step 11bis (a spline through its endpoints and
-# its own A x B intersection points) -- opening this window
-# regardless of method would let a click trigger a polynomial
-# reconstruction that does not know about those shared points,
-# undoing the whole point of choosing method 2.
-#
-# A single window both shows the sections that were created AND
-# lets you correct them, so there is no separate read-only
-# preview window to look at first.
-#
-# Click directly on a curve to add a SPLIT POINT. Each curve
-# you click at least once gets entirely rebuilt as a sequence
-# of independently-fitted polynomial portions, split at the
-# points you clicked (see reconstruct_curve_piecewise). A curve
-# you never click is left completely untouched, so clicking is
-# entirely optional and safe to skip.
-#
-# Click near an existing split point (on the same curve) to
-# remove it instead of adding a duplicate.
-
-if reconstruction_method == 1:
-
-    print()
-    print("======================================")
-    print("SECTION PREVIEW / OPTIONAL RECONSTRUCTION")
-    print("======================================")
-
-    print(
-        "All created sections are shown below (main curve per\n"
-        "section).\n"
-        "Click on a curve to add a split point (red marker).\n"
-        "Click near an existing split point to remove it.\n"
-        "Any curve with at least one split point will be rebuilt as\n"
-        "independently-fitted polynomial portions between your\n"
-        "split points (e.g. put one split where the visor ends and\n"
-        "the crown begins, so they are not fitted together).\n"
-        "Curves you never click are left untouched.\n"
-        "Close the window when done."
-    )
-
-    colors = [
-        "red",
-        "blue",
-        "green",
-        "orange",
-        "purple",
-        "cyan",
-        "yellow",
-        "pink",
-        "brown"
-    ]
-
-
-    correction_plotter = pv.Plotter(
-        window_size=(1500, 950)
-    )
-
-    correction_plotter.add_mesh(
-        mesh,
-        color="lightgray",
-        opacity=0.12,
-        show_edges=False
-    )
-
-    correction_plotter.add_text(
-        "SECTION CURVES - click to add/remove split points (optional)",
-        position="upper_left",
-        font_size=16
-    )
-
-
-    curve_actor_map = {}
-
-    for section_index, data in enumerate(all_section_data):
-
-        main_index = data["main_curve_index"]
-
-        if main_index is None:
-            continue
-
-        points_3d = data["curves"][main_index]["points_3d"]
-
-        if len(points_3d) < 2:
-            continue
-
-        color = colors[
-            section_index
-            % len(colors)
-        ]
-
-        line = pv.lines_from_points(
-            points_3d,
-            close=False
-        )
-
-        actor = correction_plotter.add_mesh(
-            line,
-            color=color,
-            line_width=6
-        )
-
-        curve_actor_map[actor] = {
-            "section_index": section_index,
-            "points": points_3d
-        }
-
-        label_point = points_3d[
-            len(points_3d) // 2
-        ]
-
-        correction_plotter.add_point_labels(
-            np.array([label_point]),
-            [
-                f"{data['direction']}{data['number']} (main)"
-            ],
-            point_size=1,
-            font_size=14,
-            shape=None
-        )
-
-
-    correction_picker = vtk.vtkCellPicker()
-    correction_picker.SetTolerance(0.005)
-    correction_picker.PickFromListOn()
-
-    for actor in curve_actor_map:
-        correction_picker.AddPickList(actor)
-
-
-    # section_index -> sorted list of split point curve-indices
-    section_splits = {}
-
-
-    def _redraw_split_markers(section_index):
-
-        points = curve_actor_map_by_section[section_index]
-
-        correction_plotter.remove_actor(
-            f"split_markers_{section_index}",
-            render=False
-        )
-
-        idxs = section_splits.get(section_index, [])
-
-        if not idxs:
-            return
-
-        marker_points = points[idxs]
-
-        marker = pv.PolyData(marker_points)
-
-        correction_plotter.add_mesh(
-            marker,
-            color="red",
-            point_size=16,
-            render_points_as_spheres=True,
-            name=f"split_markers_{section_index}"
-        )
-
-
-    curve_actor_map_by_section = {
-        info["section_index"]: info["points"]
-        for info in curve_actor_map.values()
+            print("  No sections excluded.")
+
+
+    # A separate view of the curve set with the excluded sections left
+    # out, used ONLY for surface reconstruction below. The DXF exports
+    # above (including boundary_loop.dxf) still use the full, unfiltered
+    # rich_main_curves, so excluded sections stay visible there for
+    # reference/diagnosis.
+    surface_main_curves = {
+        key: points
+        for key, points in rich_main_curves.items()
+        if key not in excluded_from_surface
     }
 
+    surface_boundary_loop_points = (
+        order_boundary_loop(collect_curve_endpoints(surface_main_curves))
+        if len(surface_main_curves) >= 3
+        else None
+    )
 
-    REMOVE_CLICK_TOLERANCE_POINTS = 3  # in curve-index units
+
+    # ============================================================
+    # 12quater. FIND A x B INTERSECTIONS ON THE FINAL CURVES
+    # ============================================================
+    #
+    # Curves have now been smoothed and (optionally) reconstructed
+    # completely on their own terms, with no intersection-related
+    # constraint at all. For every plane pair validated in step
+    # 5bis, this looks for that many distinct closest-approach
+    # locations between the FINAL curve A_i and the FINAL curve B_j
+    # -- purely to FIND and RECORD where the two curve families
+    # already meet (or nearly meet), for reference (see the
+    # intersection markers exported in step 13.4).
+    #
+    # Nothing here modifies the curves. Snapping the two closest
+    # points to a shared midpoint was tried, but even a small nudge
+    # repeated at every crossing along a curve that has many of them
+    # (a single A-curve can cross a dozen+ B-curves) reintroduces
+    # exactly the small kinks/twisting this was meant to avoid --
+    # the curves are already extremely close at these locations
+    # (typically well under a millimetre) precisely because both
+    # were independently smoothed from the same underlying surface,
+    # so forcing them together adds distortion without adding real
+    # accuracy.
 
 
-    def correction_click(caller, event):
+    def find_all_intersections(all_section_data, plane_intersections):
+        """
+        For every plane pair validated in step 5bis, looks for that
+        many distinct closest-approach locations between the CURRENT
+        curve A_i and curve B_j (whatever state they are in when this
+        is called). Returns a list of
+        {"pair_id": (i, j, k), "point": ..., "gap": ...,
+        "idx_a": ..., "idx_b": ...} where idx_a/idx_b are the point
+        indices, along curve A_i's and B_j's own points_3d array,
+        where the crossing sits -- used downstream to cut each curve
+        into segments at its crossings for surface reconstruction
+        (see curve_utils.segment_curve_at_indices).
+        Does not modify any curve.
+        """
 
-        x, y = caller.GetEventPosition()
-
-        correction_picker.Pick(
-            x,
-            y,
-            0,
-            correction_plotter.renderer
+        crossing_max_gap_mm = (
+            CROSSING_MAX_GAP_FACTOR
+            *
+            AVG_EDGE_LENGTH
         )
 
-        actor = correction_picker.GetActor()
+        curves_by_key = {}
 
-        if actor is None or actor not in curve_actor_map:
-            return
+        for data in all_section_data:
 
-        info = curve_actor_map[actor]
+            main_index = data["main_curve_index"]
 
-        points = info["points"]
+            if main_index is None:
+                continue
 
-        section_index = info["section_index"]
+            curves_by_key[(data["direction"], data["number"])] = (
+                data,
+                data["curves"][main_index]
+            )
 
-        pick_pos = np.array(
-            correction_picker.GetPickPosition()
+        results = []
+
+        for (i, j), hit_list in plane_intersections.items():
+
+            key_a = ("A", i)
+            key_b = ("B", j)
+
+            if key_a not in curves_by_key or key_b not in curves_by_key:
+                continue
+
+            _, curve_info_a = curves_by_key[key_a]
+            _, curve_info_b = curves_by_key[key_b]
+
+            pts_a = curve_info_a["points_3d"]
+            pts_b = curve_info_b["points_3d"]
+
+            if len(pts_a) < 2 or len(pts_b) < 2:
+                continue
+
+            expected_count = len(hit_list)
+
+            crossings = find_curve_crossings(
+                pts_a,
+                pts_b,
+                max_count=expected_count,
+                max_gap=crossing_max_gap_mm
+            )
+
+            if expected_count > 1:
+
+                print(
+                    f"  {('A', i)} x {('B', j)}: "
+                    f"{expected_count} crossing(s) expected, "
+                    f"{len(crossings)} found"
+                )
+
+            for k, (idx_a, idx_b, gap) in enumerate(crossings):
+
+                reference_point = (
+                    pts_a[idx_a] + pts_b[idx_b]
+                ) / 2.0
+
+                results.append(
+                    {
+                        "pair_id": (i, j, k),
+                        "point": reference_point,
+                        "gap": gap,
+                        "idx_a": int(idx_a),
+                        "idx_b": int(idx_b)
+                    }
+                )
+
+        return results
+
+
+    CROSSING_MAX_GAP_FACTOR = 10.0
+
+    # Initialised once, here, before either reconstruction method
+    # runs: method 2 fills this in directly below (it needs the
+    # intersections anyway to build its curves); method 1 fills it
+    # in later, after the interactive correction step, purely for
+    # reporting (see the end of step 12).
+    found_intersections = []
+
+
+    # ============================================================
+    # 11bis. SIMPLE SPLINE THROUGH INTERSECTIONS (method 2)
+    # ============================================================
+    #
+    # Alternative to the interactive polynomial method (still
+    # available as method 1, see step 12). Here, every A x B
+    # crossing is found FIRST, directly on the smoothed curves --
+    # then each main curve is entirely replaced by a minimal curve
+    # through just its two endpoints and its own intersection
+    # points, in order along the curve. Since curve A_i and curve
+    # B_j both get the EXACT SAME point object at a shared crossing,
+    # and both are exported as interpolating splines (fit_points),
+    # SolidWorks sees a true, formal intersection there -- not two
+    # curves merely passing close to each other. The trade-off: the
+    # curve no longer hugs the scanned shape between those points,
+    # only a smooth spline through them.
+
+    if use_plane_b and reconstruction_method == 2:
+
+        print()
+        print("======================================")
+        print("SIMPLE SPLINE THROUGH INTERSECTIONS")
+        print("======================================")
+
+        found_intersections = find_all_intersections(
+            all_section_data,
+            plane_intersections
         )
 
-        distances = np.linalg.norm(
-            points - pick_pos,
-            axis=1
+        per_curve_points = {}
+
+        for entry in found_intersections:
+
+            i, j, _ = entry["pair_id"]
+
+            point = entry["point"]
+
+            per_curve_points.setdefault(("A", i), []).append(point)
+            per_curve_points.setdefault(("B", j), []).append(point)
+
+        rebuilt_count = 0
+
+        for data in all_section_data:
+
+            main_index = data["main_curve_index"]
+
+            if main_index is None:
+                continue
+
+            curve_info = data["curves"][main_index]
+
+            assigned = per_curve_points.get(
+                (data["direction"], data["number"]),
+                []
+            )
+
+            if not assigned:
+                continue
+
+            new_points_3d = build_simple_spline_curve(
+                curve_info["points_3d"],
+                assigned
+            )
+
+            origin = data["origin"]
+            local_u = data["u"]
+            local_v = data["v"]
+
+            new_points_2d = np.array(
+                [
+                    [
+                        np.dot(point - origin, local_u),
+                        np.dot(point - origin, local_v)
+                    ]
+                    for point in new_points_3d
+                ]
+            )
+
+            curve_info["points_3d"] = new_points_3d
+            curve_info["points_2d"] = new_points_2d
+
+            rebuilt_count += 1
+
+        print(
+            f"  {len(found_intersections)} intersection point(s) "
+            f"found; {rebuilt_count} curve(s) rebuilt as a simple "
+            f"spline through their endpoints + intersections."
         )
 
-        idx = int(
-            np.argmin(distances)
+
+    # ============================================================
+    # 12. SECTION PREVIEW + OPTIONAL PIECEWISE RECONSTRUCTION
+    #     (method 1 only)
+    # ============================================================
+    #
+    # This entire interactive step only applies to reconstruction
+    # method 1. Method 2 already gave every main curve its final,
+    # exact shape in step 11bis (a spline through its endpoints and
+    # its own A x B intersection points) -- opening this window
+    # regardless of method would let a click trigger a polynomial
+    # reconstruction that does not know about those shared points,
+    # undoing the whole point of choosing method 2.
+    #
+    # A single window both shows the sections that were created AND
+    # lets you correct them, so there is no separate read-only
+    # preview window to look at first.
+    #
+    # Click directly on a curve to add a SPLIT POINT. Each curve
+    # you click at least once gets entirely rebuilt as a sequence
+    # of independently-fitted polynomial portions, split at the
+    # points you clicked (see reconstruct_curve_piecewise). A curve
+    # you never click is left completely untouched, so clicking is
+    # entirely optional and safe to skip.
+    #
+    # Click near an existing split point (on the same curve) to
+    # remove it instead of adding a duplicate.
+
+    if reconstruction_method == 1:
+
+        print()
+        print("======================================")
+        print("SECTION PREVIEW / OPTIONAL RECONSTRUCTION")
+        print("======================================")
+
+        print(
+            "All created sections are shown below (main curve per\n"
+            "section).\n"
+            "Click on a curve to add a split point (red marker).\n"
+            "Click near an existing split point to remove it.\n"
+            "Any curve with at least one split point will be rebuilt as\n"
+            "independently-fitted polynomial portions between your\n"
+            "split points (e.g. put one split where the visor ends and\n"
+            "the crown begins, so they are not fitted together).\n"
+            "Curves you never click are left untouched.\n"
+            "Close the window when done."
         )
 
-        splits = section_splits.setdefault(
-            section_index,
-            []
-        )
-
-        # Clicking near an existing split removes it (toggle).
-        near_existing = [
-            s
-            for s in splits
-            if abs(s - idx) <= REMOVE_CLICK_TOLERANCE_POINTS
+        colors = [
+            "red",
+            "blue",
+            "green",
+            "orange",
+            "purple",
+            "cyan",
+            "yellow",
+            "pink",
+            "brown"
         ]
 
-        if near_existing:
 
-            splits.remove(near_existing[0])
+        correction_plotter = pv.Plotter(
+            window_size=(1500, 950)
+        )
 
-            section_label = (
-                f"{all_section_data[section_index]['direction']}"
-                f"{all_section_data[section_index]['number']}"
+        correction_plotter.add_mesh(
+            mesh,
+            color="lightgray",
+            opacity=0.12,
+            show_edges=False
+        )
+
+        correction_plotter.add_text(
+            "SECTION CURVES - click to add/remove split points (optional)",
+            position="upper_left",
+            font_size=16
+        )
+
+
+        curve_actor_map = {}
+
+        for section_index, data in enumerate(all_section_data):
+
+            main_index = data["main_curve_index"]
+
+            if main_index is None:
+                continue
+
+            points_3d = data["curves"][main_index]["points_3d"]
+
+            if len(points_3d) < 2:
+                continue
+
+            color = colors[
+                section_index
+                % len(colors)
+            ]
+
+            line = pv.lines_from_points(
+                points_3d,
+                close=False
             )
+
+            actor = correction_plotter.add_mesh(
+                line,
+                color=color,
+                line_width=6
+            )
+
+            curve_actor_map[actor] = {
+                "section_index": section_index,
+                "points": points_3d
+            }
+
+            label_point = points_3d[
+                len(points_3d) // 2
+            ]
+
+            correction_plotter.add_point_labels(
+                np.array([label_point]),
+                [
+                    f"{data['direction']}{data['number']} (main)"
+                ],
+                point_size=1,
+                font_size=14,
+                shape=None
+            )
+
+
+        correction_picker = vtk.vtkCellPicker()
+        correction_picker.SetTolerance(0.005)
+        correction_picker.PickFromListOn()
+
+        for actor in curve_actor_map:
+            correction_picker.AddPickList(actor)
+
+
+        # section_index -> sorted list of split point curve-indices
+        section_splits = {}
+
+
+        def _redraw_split_markers(section_index):
+
+            points = curve_actor_map_by_section[section_index]
+
+            correction_plotter.remove_actor(
+                f"split_markers_{section_index}",
+                render=False
+            )
+
+            idxs = section_splits.get(section_index, [])
+
+            if not idxs:
+                return
+
+            marker_points = points[idxs]
+
+            marker = pv.PolyData(marker_points)
+
+            correction_plotter.add_mesh(
+                marker,
+                color="red",
+                point_size=16,
+                render_points_as_spheres=True,
+                name=f"split_markers_{section_index}"
+            )
+
+
+        curve_actor_map_by_section = {
+            info["section_index"]: info["points"]
+            for info in curve_actor_map.values()
+        }
+
+
+        REMOVE_CLICK_TOLERANCE_POINTS = 3  # in curve-index units
+
+
+        def correction_click(caller, event):
+
+            x, y = caller.GetEventPosition()
+
+            correction_picker.Pick(
+                x,
+                y,
+                0,
+                correction_plotter.renderer
+            )
+
+            actor = correction_picker.GetActor()
+
+            if actor is None or actor not in curve_actor_map:
+                return
+
+            info = curve_actor_map[actor]
+
+            points = info["points"]
+
+            section_index = info["section_index"]
+
+            pick_pos = np.array(
+                correction_picker.GetPickPosition()
+            )
+
+            distances = np.linalg.norm(
+                points - pick_pos,
+                axis=1
+            )
+
+            idx = int(
+                np.argmin(distances)
+            )
+
+            splits = section_splits.setdefault(
+                section_index,
+                []
+            )
+
+            # Clicking near an existing split removes it (toggle).
+            near_existing = [
+                s
+                for s in splits
+                if abs(s - idx) <= REMOVE_CLICK_TOLERANCE_POINTS
+            ]
+
+            if near_existing:
+
+                splits.remove(near_existing[0])
+
+                section_label = (
+                    f"{all_section_data[section_index]['direction']}"
+                    f"{all_section_data[section_index]['number']}"
+                )
+
+                print(
+                    f"Section {section_label}: split point removed "
+                    f"(curve index {near_existing[0]})"
+                )
+
+            else:
+
+                splits.append(idx)
+                splits.sort()
+
+                section_label = (
+                    f"{all_section_data[section_index]['direction']}"
+                    f"{all_section_data[section_index]['number']}"
+                )
+
+                print(
+                    f"Section {section_label}: split point added "
+                    f"(curve index {idx})"
+                )
+
+            _redraw_split_markers(section_index)
+
+            correction_plotter.render()
+
+
+        correction_plotter.iren.add_observer(
+            "LeftButtonPressEvent",
+            correction_click
+        )
+
+        correction_plotter.add_axes()
+
+        correction_plotter.show()
+
+
+        print()
+        print("Applying piecewise reconstruction...")
+
+        corrections_applied = 0
+
+        for section_index, splits in section_splits.items():
+
+            if len(splits) == 0:
+                continue
+
+            data = all_section_data[section_index]
+
+            main_index = data["main_curve_index"]
+
+            curve_info = data["curves"][main_index]
+
+            reconstructed_3d, portions_info = reconstruct_curve_piecewise(
+                curve_info["points_3d"],
+                split_indices=splits,
+                max_degree=max_polynomial_degree,
+                r2_target=r2_target
+            )
+
+            if not portions_info:
+                continue
+
+            origin = data["origin"]
+            local_u = data["u"]
+            local_v = data["v"]
+
+            reconstructed_2d = []
+
+            for point in reconstructed_3d:
+
+                x = np.dot(point - origin, local_u)
+                y = np.dot(point - origin, local_v)
+
+                reconstructed_2d.append([x, y])
+
+            curve_info["points_3d"] = reconstructed_3d
+            curve_info["points_2d"] = np.asarray(reconstructed_2d)
+
+            corrections_applied += 1
 
             print(
-                f"Section {section_label}: split point removed "
-                f"(curve index {near_existing[0]})"
+                f"  Section {data['direction']}{data['number']}: rebuilt as "
+                f"{len(portions_info)} portion(s):"
             )
+
+            for lo, hi, degree_used, r2_achieved in portions_info:
+
+                reached = "OK" if r2_achieved >= r2_target else "max degree reached"
+
+                print(
+                    f"    indices [{lo}-{hi}]: "
+                    f"degree {degree_used}, "
+                    f"R^2 = {r2_achieved:.4f} ({reached})"
+                )
+
+        if corrections_applied == 0:
+            print("  No curve was reconstructed (no split point was set).")
+    else:
+
+        print()
+        print(
+            "Reconstruction method 2 (simple spline through "
+            "intersections) already finalised every main curve in "
+            "step 11bis -- skipping the interactive window so it "
+            "cannot be accidentally overwritten."
+        )
+
+
+    if use_plane_b and reconstruction_method == 1:
+
+        print()
+        print("======================================")
+        print("FINDING A x B INTERSECTIONS (final curves)")
+        print("======================================")
+
+        found_intersections = find_all_intersections(
+            all_section_data,
+            plane_intersections
+        )
+
+        max_gap_found = max(
+            (entry["gap"] for entry in found_intersections),
+            default=0.0
+        )
+
+        print(
+            f"  {len(found_intersections)} intersection point(s) "
+            f"found on the final curves "
+            f"(max residual gap between the two curves: "
+            f"{max_gap_found:.4f} mm)."
+        )
+
+    elif not use_plane_b:
+
+        print()
+        print(
+            "Plane B not used - no A x B intersections to find."
+        )
+
+
+    # ============================================================
+    # 13. EXPORT DXF
+
+    print()
+    print("======================================")
+    print("EXPORTING DXF FILES")
+    print("======================================")
+
+
+    all_dir = os.path.join(
+        output_dir,
+        "sections_all"
+    )
+
+    main_dir = os.path.join(
+        output_dir,
+        "sections_main"
+    )
+
+    dir3d = os.path.join(
+        output_dir,
+        "sections_3d"
+    )
+
+    os.makedirs(all_dir, exist_ok=True)
+    os.makedirs(main_dir, exist_ok=True)
+    os.makedirs(dir3d, exist_ok=True)
+
+
+    def new_dxf_document():
+        """
+        ezdxf.new() defaults a fresh document's $INSUNITS header to
+        METRES, not millimetres -- every coordinate this script writes
+        is in mm (see UNIT_TO_MM / ask_unit() above), so leaving that
+        default in place tags every exported file as being in metres
+        while it actually contains mm-scale numbers. A CAD import that
+        trusts the DXF's declared unit (e.g. importing into a SolidWorks
+        document whose own units are set to meters) then silently
+        inflates every dimension by 1000x on import. Setting mm here
+        explicitly is what actually fixes that -- independently of
+        whatever unit the source STL itself was in.
+        """
+
+        doc = ezdxf.new("R2010")
+        doc.units = ezdxf.units.MM
+
+        return doc
+
+
+    def make_spline_points(points_2d_or_3d, is_3d=False):
+        """Resample a curve and return a list of ezdxf-ready 3-tuples."""
+
+        if len(points_2d_or_3d) > 200:
+            n = N_MAIN
+        else:
+            n = N_SMALL
+
+        simplified = resample(
+            points_2d_or_3d,
+            n
+        )
+
+        if is_3d:
+
+            return [
+                (float(p[0]), float(p[1]), float(p[2]))
+                for p in simplified
+            ]
 
         else:
 
-            splits.append(idx)
-            splits.sort()
-
-            section_label = (
-                f"{all_section_data[section_index]['direction']}"
-                f"{all_section_data[section_index]['number']}"
-            )
-
-            print(
-                f"Section {section_label}: split point added "
-                f"(curve index {idx})"
-            )
-
-        _redraw_split_markers(section_index)
-
-        correction_plotter.render()
+            return [
+                (float(p[0]), float(p[1]), 0.0)
+                for p in simplified
+            ]
 
 
-    correction_plotter.iren.add_observer(
-        "LeftButtonPressEvent",
-        correction_click
-    )
+    # --------------------------------------------------------
+    # 13bis. RESAMPLE MAIN CURVES FOR EXPORT
+    # --------------------------------------------------------
+    #
+    # Method 1 curves are resampled normally for a clean DXF spline.
+    # Method 2 curves must NOT be resampled: they are already the
+    # minimal, deliberate point set (endpoints + exact intersection
+    # points) built in step 11bis, and a fixed-count arc-length
+    # resample would interpolate a brand new set of points that,
+    # again, does not land back on those exact shared coordinates --
+    # undoing the whole point of method 2. They are exported exactly
+    # as built.
 
-    correction_plotter.add_axes()
+    resampled_main_3d = {}
 
-    correction_plotter.show()
-
-
-    print()
-    print("Applying piecewise reconstruction...")
-
-    corrections_applied = 0
-
-    for section_index, splits in section_splits.items():
-
-        if len(splits) == 0:
-            continue
-
-        data = all_section_data[section_index]
+    for data in all_section_data:
 
         main_index = data["main_curve_index"]
 
+        if main_index is None:
+            continue
+
         curve_info = data["curves"][main_index]
 
-        reconstructed_3d, portions_info = reconstruct_curve_piecewise(
-            curve_info["points_3d"],
-            split_indices=splits,
-            max_degree=max_polynomial_degree,
-            r2_target=r2_target
+        curve_3d = curve_info["points_3d"]
+
+        if reconstruction_method == 2:
+
+            if len(curve_3d) < 2:
+                continue
+
+            resampled_main_3d[(data["direction"], data["number"])] = curve_3d
+
+            continue
+
+        if len(curve_3d) < 4:
+            continue
+
+        n_resample = N_MAIN if len(curve_3d) > 200 else N_SMALL
+
+        resampled_main_3d[(data["direction"], data["number"])] = resample(
+            curve_3d,
+            n_resample
         )
 
-        if not portions_info:
-            continue
 
-        origin = data["origin"]
-        local_u = data["u"]
-        local_v = data["v"]
+    # --------------------------------------------------------
+    # 13.1 sections_all : toutes les courbes de chaque section
+    # --------------------------------------------------------
 
-        reconstructed_2d = []
+    print()
+    print("--- sections_all ---")
 
-        for point in reconstructed_3d:
+    for data in all_section_data:
 
-            x = np.dot(point - origin, local_u)
-            y = np.dot(point - origin, local_v)
+        offset = data["offset"]
 
-            reconstructed_2d.append([x, y])
-
-        curve_info["points_3d"] = reconstructed_3d
-        curve_info["points_2d"] = np.asarray(reconstructed_2d)
-
-        corrections_applied += 1
-
-        print(
-            f"  Section {data['direction']}{data['number']}: rebuilt as "
-            f"{len(portions_info)} portion(s):"
+        filename = (
+            f"plane{data['direction']}_{offset:+07.2f}mm_all.dxf"
         )
 
-        for lo, hi, degree_used, r2_achieved in portions_info:
+        dxf_path = os.path.join(
+            all_dir,
+            filename
+        )
 
-            reached = "OK" if r2_achieved >= r2_target else "max degree reached"
+        doc = new_dxf_document()
+        msp = doc.modelspace()
 
-            print(
-                f"    indices [{lo}-{hi}]: "
-                f"degree {degree_used}, "
-                f"R^2 = {r2_achieved:.4f} ({reached})"
-            )
+        for curve_info in data["curves"]:
 
-    if corrections_applied == 0:
-        print("  No curve was reconstructed (no split point was set).")
-else:
+            curve_2d = curve_info["points_2d"]
 
-    print()
-    print(
-        "Reconstruction method 2 (simple spline through "
-        "intersections) already finalised every main curve in "
-        "step 11bis -- skipping the interactive window so it "
-        "cannot be accidentally overwritten."
-    )
+            if len(curve_2d) < 4:
+                continue
+
+            points = make_spline_points(curve_2d)
+
+            msp.add_spline(fit_points=points)
+
+        doc.saveas(dxf_path)
+
+        print(dxf_path)
 
 
-if use_plane_b and reconstruction_method == 1:
-
-    print()
-    print("======================================")
-    print("FINDING A x B INTERSECTIONS (final curves)")
-    print("======================================")
-
-    found_intersections = find_all_intersections(
-        all_section_data,
-        plane_intersections
-    )
-
-    max_gap_found = max(
-        (entry["gap"] for entry in found_intersections),
-        default=0.0
-    )
-
-    print(
-        f"  {len(found_intersections)} intersection point(s) "
-        f"found on the final curves "
-        f"(max residual gap between the two curves: "
-        f"{max_gap_found:.4f} mm)."
-    )
-
-elif not use_plane_b:
+    # --------------------------------------------------------
+    # 13.2 sections_main : uniquement la courbe principale
+    #      (la languette est exclue car ce n'est pas la
+    #      courbe la plus longue de la section)
+    # --------------------------------------------------------
 
     print()
-    print(
-        "Plane B not used - no A x B intersections to find."
+    print("--- sections_main ---")
+
+    for data in all_section_data:
+
+        offset = data["offset"]
+
+        filename = (
+            f"plane{data['direction']}_{offset:+07.2f}mm_main.dxf"
+        )
+
+        dxf_path = os.path.join(
+            main_dir,
+            filename
+        )
+
+        doc = new_dxf_document()
+        msp = doc.modelspace()
+
+        key = (data["direction"], data["number"])
+
+        if key in resampled_main_3d:
+
+            curve_3d_final = resampled_main_3d[key]
+
+            origin = data["origin"]
+            local_u = data["u"]
+            local_v = data["v"]
+
+            points = [
+                (
+                    float(np.dot(p - origin, local_u)),
+                    float(np.dot(p - origin, local_v)),
+                    0.0
+                )
+                for p in curve_3d_final
+            ]
+
+            msp.add_spline(fit_points=points)
+
+        doc.saveas(dxf_path)
+
+        print(dxf_path)
+
+
+    # --------------------------------------------------------
+    # 13.3 sections_3d : un seul DXF avec toutes les courbes
+    #      principales assemblees dans leur position spatiale
+    #      reelle (utile pour verifier la geometrie avant
+    #      SolidWorks)
+    # --------------------------------------------------------
+
+    print()
+    print("--- sections_3d ---")
+
+    dxf_path_3d = os.path.join(
+        dir3d,
+        "sections_main_3d.dxf"
     )
 
+    doc3d = new_dxf_document()
+    msp3d = doc3d.modelspace()
 
-# ============================================================
-# 13. EXPORT DXF
+    for data in all_section_data:
 
-print()
-print("======================================")
-print("EXPORTING DXF FILES")
-print("======================================")
+        key = (data["direction"], data["number"])
 
-
-all_dir = os.path.join(
-    output_dir,
-    "sections_all"
-)
-
-main_dir = os.path.join(
-    output_dir,
-    "sections_main"
-)
-
-dir3d = os.path.join(
-    output_dir,
-    "sections_3d"
-)
-
-os.makedirs(all_dir, exist_ok=True)
-os.makedirs(main_dir, exist_ok=True)
-os.makedirs(dir3d, exist_ok=True)
-
-
-def new_dxf_document():
-    """
-    ezdxf.new() defaults a fresh document's $INSUNITS header to
-    METRES, not millimetres -- every coordinate this script writes
-    is in mm (see UNIT_TO_MM / ask_unit() above), so leaving that
-    default in place tags every exported file as being in metres
-    while it actually contains mm-scale numbers. A CAD import that
-    trusts the DXF's declared unit (e.g. importing into a SolidWorks
-    document whose own units are set to meters) then silently
-    inflates every dimension by 1000x on import. Setting mm here
-    explicitly is what actually fixes that -- independently of
-    whatever unit the source STL itself was in.
-    """
-
-    doc = ezdxf.new("R2010")
-    doc.units = ezdxf.units.MM
-
-    return doc
-
-
-def make_spline_points(points_2d_or_3d, is_3d=False):
-    """Resample a curve and return a list of ezdxf-ready 3-tuples."""
-
-    if len(points_2d_or_3d) > 200:
-        n = N_MAIN
-    else:
-        n = N_SMALL
-
-    simplified = resample(
-        points_2d_or_3d,
-        n
-    )
-
-    if is_3d:
-
-        return [
-            (float(p[0]), float(p[1]), float(p[2]))
-            for p in simplified
-        ]
-
-    else:
-
-        return [
-            (float(p[0]), float(p[1]), 0.0)
-            for p in simplified
-        ]
-
-
-# --------------------------------------------------------
-# 13bis. RESAMPLE MAIN CURVES FOR EXPORT
-# --------------------------------------------------------
-#
-# Method 1 curves are resampled normally for a clean DXF spline.
-# Method 2 curves must NOT be resampled: they are already the
-# minimal, deliberate point set (endpoints + exact intersection
-# points) built in step 11bis, and a fixed-count arc-length
-# resample would interpolate a brand new set of points that,
-# again, does not land back on those exact shared coordinates --
-# undoing the whole point of method 2. They are exported exactly
-# as built.
-
-resampled_main_3d = {}
-
-for data in all_section_data:
-
-    main_index = data["main_curve_index"]
-
-    if main_index is None:
-        continue
-
-    curve_info = data["curves"][main_index]
-
-    curve_3d = curve_info["points_3d"]
-
-    if reconstruction_method == 2:
-
-        if len(curve_3d) < 2:
+        if key not in resampled_main_3d:
             continue
-
-        resampled_main_3d[(data["direction"], data["number"])] = curve_3d
-
-        continue
-
-    if len(curve_3d) < 4:
-        continue
-
-    n_resample = N_MAIN if len(curve_3d) > 200 else N_SMALL
-
-    resampled_main_3d[(data["direction"], data["number"])] = resample(
-        curve_3d,
-        n_resample
-    )
-
-
-# --------------------------------------------------------
-# 13.1 sections_all : toutes les courbes de chaque section
-# --------------------------------------------------------
-
-print()
-print("--- sections_all ---")
-
-for data in all_section_data:
-
-    offset = data["offset"]
-
-    filename = (
-        f"plane{data['direction']}_{offset:+07.2f}mm_all.dxf"
-    )
-
-    dxf_path = os.path.join(
-        all_dir,
-        filename
-    )
-
-    doc = new_dxf_document()
-    msp = doc.modelspace()
-
-    for curve_info in data["curves"]:
-
-        curve_2d = curve_info["points_2d"]
-
-        if len(curve_2d) < 4:
-            continue
-
-        points = make_spline_points(curve_2d)
-
-        msp.add_spline(fit_points=points)
-
-    doc.saveas(dxf_path)
-
-    print(dxf_path)
-
-
-# --------------------------------------------------------
-# 13.2 sections_main : uniquement la courbe principale
-#      (la languette est exclue car ce n'est pas la
-#      courbe la plus longue de la section)
-# --------------------------------------------------------
-
-print()
-print("--- sections_main ---")
-
-for data in all_section_data:
-
-    offset = data["offset"]
-
-    filename = (
-        f"plane{data['direction']}_{offset:+07.2f}mm_main.dxf"
-    )
-
-    dxf_path = os.path.join(
-        main_dir,
-        filename
-    )
-
-    doc = new_dxf_document()
-    msp = doc.modelspace()
-
-    key = (data["direction"], data["number"])
-
-    if key in resampled_main_3d:
 
         curve_3d_final = resampled_main_3d[key]
 
-        origin = data["origin"]
-        local_u = data["u"]
-        local_v = data["v"]
-
         points = [
-            (
-                float(np.dot(p - origin, local_u)),
-                float(np.dot(p - origin, local_v)),
-                0.0
-            )
+            (float(p[0]), float(p[1]), float(p[2]))
             for p in curve_3d_final
         ]
 
-        msp.add_spline(fit_points=points)
+        msp3d.add_spline(fit_points=points)
 
-    doc.saveas(dxf_path)
+    if boundary_loop_points is not None:
 
-    print(dxf_path)
-
-
-# --------------------------------------------------------
-# 13.3 sections_3d : un seul DXF avec toutes les courbes
-#      principales assemblees dans leur position spatiale
-#      reelle (utile pour verifier la geometrie avant
-#      SolidWorks)
-# --------------------------------------------------------
-
-print()
-print("--- sections_3d ---")
-
-dxf_path_3d = os.path.join(
-    dir3d,
-    "sections_main_3d.dxf"
-)
-
-doc3d = new_dxf_document()
-msp3d = doc3d.modelspace()
-
-for data in all_section_data:
-
-    key = (data["direction"], data["number"])
-
-    if key not in resampled_main_3d:
-        continue
-
-    curve_3d_final = resampled_main_3d[key]
-
-    points = [
-        (float(p[0]), float(p[1]), float(p[2]))
-        for p in curve_3d_final
-    ]
-
-    msp3d.add_spline(fit_points=points)
-
-if boundary_loop_points is not None:
-
-    closed_boundary_points = np.vstack(
-        [boundary_loop_points, boundary_loop_points[0:1]]
-    )
-
-    msp3d.add_spline(
-        fit_points=[
-            (float(p[0]), float(p[1]), float(p[2]))
-            for p in closed_boundary_points
-        ]
-    )
-
-doc3d.saveas(dxf_path_3d)
-
-print(dxf_path_3d)
-
-
-# --------------------------------------------------------
-# 13.4 intersections_reference : marqueurs (points) aux
-#      endroits ou les courbes A et B se croisent le plus
-#      pres, pour verification visuelle dans SolidWorks.
-#      Purement informatif : les courbes elles-memes ne sont
-#      jamais modifiees pour "coller" a ces points.
-# --------------------------------------------------------
-
-if use_plane_b and found_intersections:
-
-    print()
-    print("--- intersections_reference ---")
-
-    dxf_path_intersections = os.path.join(
-        dir3d,
-        "intersections_reference.dxf"
-    )
-
-    doc_int = new_dxf_document()
-    msp_int = doc_int.modelspace()
-
-    for entry in found_intersections:
-
-        i, j, k = entry["pair_id"]
-
-        point = entry["point"]
-
-        msp_int.add_point(
-            (float(point[0]), float(point[1]), float(point[2]))
+        closed_boundary_points = np.vstack(
+            [boundary_loop_points, boundary_loop_points[0:1]]
         )
 
-        msp_int.add_text(
-            f"A{i}xB{j}",
-            height=AVG_EDGE_LENGTH
-        ).set_placement(
-            (float(point[0]), float(point[1]), float(point[2]))
+        msp3d.add_spline(
+            fit_points=[
+                (float(p[0]), float(p[1]), float(p[2]))
+                for p in closed_boundary_points
+            ]
         )
 
-    doc_int.saveas(dxf_path_intersections)
+    doc3d.saveas(dxf_path_3d)
 
-    print(dxf_path_intersections)
+    print(dxf_path_3d)
 
 
-# --------------------------------------------------------
-# 13.5 boundary_loop : la meme spline fermee deja added a
-#      sections_main_3d.dxf (step 13.3), aussi ecrite dans son
-#      propre fichier pour qu'elle soit facile a isoler/reutiliser
-#      seule (ex: fermer la coque en step 14).
-# --------------------------------------------------------
+    # --------------------------------------------------------
+    # 13.4 intersections_reference : marqueurs (points) aux
+    #      endroits ou les courbes A et B se croisent le plus
+    #      pres, pour verification visuelle dans SolidWorks.
+    #      Purement informatif : les courbes elles-memes ne sont
+    #      jamais modifiees pour "coller" a ces points.
+    # --------------------------------------------------------
 
-if boundary_loop_points is not None:
+    if use_plane_b and found_intersections:
 
-    print()
-    print("--- boundary_loop ---")
+        print()
+        print("--- intersections_reference ---")
 
-    boundary_path = os.path.join(
-        dir3d,
-        "boundary_loop.dxf"
+        dxf_path_intersections = os.path.join(
+            dir3d,
+            "intersections_reference.dxf"
+        )
+
+        doc_int = new_dxf_document()
+        msp_int = doc_int.modelspace()
+
+        for entry in found_intersections:
+
+            i, j, k = entry["pair_id"]
+
+            point = entry["point"]
+
+            msp_int.add_point(
+                (float(point[0]), float(point[1]), float(point[2]))
+            )
+
+            msp_int.add_text(
+                f"A{i}xB{j}",
+                height=AVG_EDGE_LENGTH
+            ).set_placement(
+                (float(point[0]), float(point[1]), float(point[2]))
+            )
+
+        doc_int.saveas(dxf_path_intersections)
+
+        print(dxf_path_intersections)
+
+
+    # --------------------------------------------------------
+    # 13.5 boundary_loop : la meme spline fermee deja added a
+    #      sections_main_3d.dxf (step 13.3), aussi ecrite dans son
+    #      propre fichier pour qu'elle soit facile a isoler/reutiliser
+    #      seule (ex: fermer la coque en step 14).
+    # --------------------------------------------------------
+
+    if boundary_loop_points is not None:
+
+        print()
+        print("--- boundary_loop ---")
+
+        boundary_path = os.path.join(
+            dir3d,
+            "boundary_loop.dxf"
+        )
+
+        doc_boundary = new_dxf_document()
+        msp_boundary = doc_boundary.modelspace()
+
+        closed_boundary_points = np.vstack(
+            [boundary_loop_points, boundary_loop_points[0:1]]
+        )
+
+        msp_boundary.add_spline(
+            fit_points=[
+                (float(p[0]), float(p[1]), float(p[2]))
+                for p in closed_boundary_points
+            ]
+        )
+
+        doc_boundary.saveas(boundary_path)
+
+        print(boundary_path)
+
+    if surface_boundary_loop_points is not None and excluded_from_surface:
+
+        # A second copy reflecting the exclusions from step 12bis --
+        # what the STEP export in step 14 actually builds the surface
+        # from. Lets the boundary be checked visually (e.g. still
+        # jagged somewhere? try excluding another section) without
+        # having to run the STEP export itself each time. Only written
+        # when something was actually excluded; otherwise it would be
+        # identical to boundary_loop.dxf above.
+
+        print()
+        print("--- boundary_loop_surface ---")
+
+        surface_boundary_path = os.path.join(
+            dir3d,
+            "boundary_loop_surface.dxf"
+        )
+
+        doc_surface_boundary = new_dxf_document()
+        msp_surface_boundary = doc_surface_boundary.modelspace()
+
+        closed_surface_boundary_points = np.vstack(
+            [surface_boundary_loop_points, surface_boundary_loop_points[0:1]]
+        )
+
+        msp_surface_boundary.add_spline(
+            fit_points=[
+                (float(p[0]), float(p[1]), float(p[2]))
+                for p in closed_surface_boundary_points
+            ]
+        )
+
+        doc_surface_boundary.saveas(surface_boundary_path)
+
+        print(surface_boundary_path)
+
+    elif surface_boundary_loop_points is not None:
+
+        # No exclusions this run -- remove any boundary_loop_surface.dxf
+        # left over from an earlier run that DID exclude sections, so the
+        # output folder can't be mistaken for still reflecting exclusions
+        # that no longer apply (it would otherwise sit there looking
+        # identical to boundary_loop.dxf, since both now come from the
+        # same, unfiltered curve set).
+        stale_surface_boundary_path = os.path.join(
+            dir3d,
+            "boundary_loop_surface.dxf"
+        )
+
+        if os.path.isfile(stale_surface_boundary_path):
+            os.remove(stale_surface_boundary_path)
+
+    return surface_boundary_loop_points, surface_main_curves
+
+
+# ============================================================
+# 13ter. RUN THE PIPELINE ABOVE ONCE PER PANEL
+# ============================================================
+#
+# process_panel (above) is everything this script used to do at
+# module level, in one pass over the whole mesh -- now parameterized
+# on `mesh`/`output_dir` and called once per entry in `panel_meshes`
+# (see step 2ter: a single ("", mesh) entry, unchanged behaviour, if
+# no seams were traced there).
+
+surface_regions = []
+
+for panel_label, panel_mesh in panel_meshes:
+
+    panel_output_dir = (
+        output_dir if len(panel_meshes) == 1
+        else os.path.join(output_dir, f"panel_{panel_label}")
     )
 
-    doc_boundary = new_dxf_document()
-    msp_boundary = doc_boundary.modelspace()
+    os.makedirs(panel_output_dir, exist_ok=True)
 
-    closed_boundary_points = np.vstack(
-        [boundary_loop_points, boundary_loop_points[0:1]]
+    if len(panel_meshes) > 1:
+        print()
+        print("######################################")
+        print(f"PANEL {panel_label}/{len(panel_meshes)}")
+        print("######################################")
+
+    panel_boundary_loop_points, panel_main_curves = process_panel(
+        panel_mesh, panel_output_dir
     )
 
-    msp_boundary.add_spline(
-        fit_points=[
-            (float(p[0]), float(p[1]), float(p[2]))
-            for p in closed_boundary_points
-        ]
-    )
+    if panel_boundary_loop_points is not None:
 
-    doc_boundary.saveas(boundary_path)
-
-    print(boundary_path)
-
-if surface_boundary_loop_points is not None and excluded_from_surface:
-
-    # A second copy reflecting the exclusions from step 12bis --
-    # what the STEP export in step 14 actually builds the surface
-    # from. Lets the boundary be checked visually (e.g. still
-    # jagged somewhere? try excluding another section) without
-    # having to run the STEP export itself each time. Only written
-    # when something was actually excluded; otherwise it would be
-    # identical to boundary_loop.dxf above.
-
-    print()
-    print("--- boundary_loop_surface ---")
-
-    surface_boundary_path = os.path.join(
-        dir3d,
-        "boundary_loop_surface.dxf"
-    )
-
-    doc_surface_boundary = new_dxf_document()
-    msp_surface_boundary = doc_surface_boundary.modelspace()
-
-    closed_surface_boundary_points = np.vstack(
-        [surface_boundary_loop_points, surface_boundary_loop_points[0:1]]
-    )
-
-    msp_surface_boundary.add_spline(
-        fit_points=[
-            (float(p[0]), float(p[1]), float(p[2]))
-            for p in closed_surface_boundary_points
-        ]
-    )
-
-    doc_surface_boundary.saveas(surface_boundary_path)
-
-    print(surface_boundary_path)
-
-elif surface_boundary_loop_points is not None:
-
-    # No exclusions this run -- remove any boundary_loop_surface.dxf
-    # left over from an earlier run that DID exclude sections, so the
-    # output folder can't be mistaken for still reflecting exclusions
-    # that no longer apply (it would otherwise sit there looking
-    # identical to boundary_loop.dxf, since both now come from the
-    # same, unfiltered curve set).
-    stale_surface_boundary_path = os.path.join(
-        dir3d,
-        "boundary_loop_surface.dxf"
-    )
-
-    if os.path.isfile(stale_surface_boundary_path):
-        os.remove(stale_surface_boundary_path)
+        surface_regions.append({
+            "boundary_loop": panel_boundary_loop_points,
+            "interior_curves": list(panel_main_curves.values())
+        })
 
 
 # ============================================================
@@ -3040,10 +3130,11 @@ elif surface_boundary_loop_points is not None:
 # needs have no Windows wheels for this script's own Python version,
 # so they can't be imported into this process directly.
 #
-# One surface per region in surface_regions (step 12ter above) -- by
+# One surface per region in surface_regions (step 13ter above) -- by
 # default that's the whole patch as a single region (unchanged
-# behaviour), or two simpler, individually better-behaved surfaces if
-# a separator was traced, sewn together into one shape here.
+# behaviour), or one simpler, individually better-behaved surface per
+# panel if seams were traced (step 2ter), sewn together into one
+# shape here.
 #
 # This used to be a per-grid-cell patchwork (one small Coons-style
 # patch per A x B cell, sewn into a shell). On a real scan that came

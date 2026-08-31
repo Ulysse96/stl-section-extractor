@@ -19,16 +19,21 @@ it back to the console, and waits for a key press before closing, so the
 window (and `log.txt`) always has the full output, even after a crash.
 
 1. A file dialog opens — select the STL to process.
-2. A 3D view opens — click 3 points (plane A only) or 5 points (plane A +
+2. A 3D view opens for optionally splitting the object into panels before
+   anything else happens — see
+   [Separating into panels](#surface-reconstruction-step-export) below.
+   Close the window without clicking anything if this doesn't apply to you.
+3. A 3D view opens — click 3 points (plane A only) or 5 points (plane A +
    perpendicular plane B) on the mesh to define the cutting plane(s), then
    close the window.
-3. A form window lets you set the section width/count for each plane,
+4. A form window lets you set the section width/count for each plane,
    curve smoothing strength, optional ideal-curve fitting, and the
    piecewise polynomial reconstruction settings.
-4. The script slices the mesh, extracts and processes each section's
-   curves, and writes DXF files next to the source STL, in a
-   `<stl name>_sections/` folder.
-5. If plane B was used (5-point selection), it also reconstructs the
+5. The script slices the mesh (once per panel, if split in step 2),
+   extracts and processes each section's curves, and writes DXF files next
+   to the source STL, in a `<stl name>_sections/` folder (or
+   `<stl name>_sections/panel_<n>/` per panel, if split).
+6. If plane B was used (5-point selection), it also reconstructs the
    scanned surface and exports it as STEP — see
    [Surface reconstruction (STEP export)](#surface-reconstruction-step-export)
    below for the one-time setup this needs.
@@ -206,46 +211,61 @@ not. A real cap is several separate panels (crown, visor, ...), not
 one continuous surface — asking one B-spline to reconcile a near-flat
 visor and a domed crown at once is a lot to ask of a single fit.
 
-After the "EXCLUDE SECTIONS" window, a "SEPARATE INTO PANELS" window
-opens: click a sequence of points along a seam directly on the mesh
-(e.g. where the visor meets the crown), both ends near the outer edge.
-Press `n` to finish that seam and trace another one — each further
-seam must stay within a single panel already split off so far (trace
-the crown/visor seam first; a seam splitting a *further* panel off has
-to be traced within one of those two results, not across both at
-once). Close the window when done. Each seam splits its own panel into
-two separate, individually simpler surfaces
-(`curve_utils.split_into_panels`, built on
-`split_boundary_and_curves_at_separator` applied once per seam)
-instead of one surface spanning every region's curvature at once —
-every resulting panel gets its own retry-with-looser-tolerance attempt
-(see above), and all of them are sewn together at their shared seams
-before being written to one STEP file. No clicks (or just one point)
-— the default — keeps the single-surface behaviour unchanged.
+A first version of this split the CURVE NETWORK into panels after the
+whole mesh had already been sliced into A/B section curves — snapping
+a seam's two ends to the nearest point in the boundary loop's own
+array, re-deriving each panel's boundary from an arc of that array
+plus the seam. It shipped and mostly worked, but kept failing in
+sharp-edged ways traceable to exactly that: a seam snapped to an
+adjacent boundary index once produced a 3-point "boundary" that still
+passed every downstream check (a boundary that small is trivially easy
+to stay technically close to) while building a physically twisted,
+nonsensical surface. **Panels are now split at the MESH level,
+before any A/B slicing happens at all**, which avoids that whole class
+of failure structurally rather than needing another guard rail: each
+resulting sub-mesh gets its own boundary loop the normal way, once
+*it* is sliced on its own — there is no boundary array to snap a seam
+onto in the first place.
 
-If one panel still can't be fit after every retry (a seam traced too
-close to an existing panel edge can carve off a thin, hard-to-fit
-sliver — confirmed on a real scan), that panel is skipped, with a
-clear message saying so — the STEP file still gets written with every
-OTHER panel that did succeed, rather than the whole export coming up
-empty over one bad seam. Retrace that specific seam (further from the
-existing boundary) and re-run if the skipped panel was actually
-needed.
+Right after the mesh loads (before the 3/5-point cutting-plane pick), a
+"SEPARATE INTO PANELS" window opens: click a sequence of points along a
+seam directly on the mesh (e.g. where the visor meets the crown), both
+ends near the outer edge. Press `n` to finish that seam and trace
+another one — each further seam must stay within a single panel
+already split off so far (trace the crown/visor seam first; a seam
+splitting a *further* panel off has to be traced within one of those
+two results, not across both at once). Close the window when done (no
+clicks, or just one point, keeps today's single-surface behaviour
+unchanged). This step matters only if you'll go on to pick plane B and
+use STEP export — if you're only using plane A for DXF curves, just
+close the window without clicking anything.
 
-A seam whose two ends snap too close together along the boundary is
-rejected up front, the same way, rather than silently building a
-razor-thin sliver region: confirmed on a real scan with several seams
-traced close together, one boundary ended up with only 3 points, which
-still "passed" every downstream check (a boundary that small is easy
-to stay technically close to) while producing a badly twisted,
-physically nonsensical surface. One bad seam like this is skipped and
-reported on its own, too — it doesn't discard every OTHER seam that
-was traced correctly.
+Every mesh cell is classified by which side of the seam(s) its own
+centroid falls on (`curve_utils.assign_points_to_panels`), and each
+resulting panel is then run through the ENTIRE pipeline independently
+— its own A/B slicing, its own curve extraction/reconstruction, its
+own "EXCLUDE SECTIONS" window, its own DXF export (into
+`<stl name>_sections/panel_<n>/`, alongside the usual
+`sections_all/sections_main/sections_3d` layout — a single
+`<stl name>_sections/` with no `panel_` subfolders, unchanged from
+before, when no seams were traced) — before every panel's resulting
+surface is sewn together into one STEP file at the end, same as
+before. Every resulting panel still gets its own
+retry-with-looser-tolerance attempt (see above), and one that still
+can't be fit after every retry is skipped (with a clear message saying
+so) rather than taking down the whole export — the STEP file still
+gets written with every other panel that did succeed.
+
+A seam whose two ends land too close together (leaving almost no cells
+on one side) is rejected up front, the same way, rather than silently
+building a razor-thin sliver panel — and, same as an unbuildable panel,
+one bad seam like this is skipped and reported on its own; it doesn't
+discard every OTHER seam that was traced correctly.
 
 **Only edge-to-edge seams are supported for now**: both ends of a seam
-must land on the outer boundary (of the panel being split). A seam
-fully enclosed inside a panel's outline (a button, a back tab — not
-touching any outer edge) isn't supported yet.
+must land within the same existing panel, snapping to its nearest
+points. A seam fully enclosed inside a panel's outline (a button, a
+back tab — not touching any outer edge) isn't supported yet.
 
 **A "good" surface can still render wrong in SolidWorks specifically**:
 even with real, correct geometry (independently re-verified: reading

@@ -4,6 +4,7 @@ import pytest
 from curve_utils import (
     UNIT_TO_MM,
     _segments_intersect_2d,
+    assign_points_to_panels,
     build_simple_spline_curve,
     collect_curve_endpoints,
     find_curve_crossings,
@@ -12,8 +13,6 @@ from curve_utils import (
     reconstruct_curve_piecewise,
     resample,
     smooth_curve,
-    split_boundary_and_curves_at_separator,
-    split_into_panels,
     stitch_curve_fragments,
 )
 
@@ -416,185 +415,68 @@ def test_collect_curve_endpoints_skips_degenerate_curves():
 
 
 # --------------------------------------------------------------
-# split_boundary_and_curves_at_separator
+# assign_points_to_panels
 # --------------------------------------------------------------
 
-def _square_boundary_loop():
-    # A 4x4 square's perimeter, densely enough sampled that a
-    # separator's two ends land on distinct boundary points -- stands
-    # in for order_boundary_loop's real output on a scanned patch.
-    boundary = []
-    for x in np.linspace(0, 4, 9):
-        boundary.append([x, 0, 0])
-    for y in np.linspace(0, 4, 9)[1:]:
-        boundary.append([4, y, 0])
-    for x in np.linspace(4, 0, 9)[1:]:
-        boundary.append([x, 4, 0])
-    for y in np.linspace(4, 0, 9)[1:-1]:
-        boundary.append([0, y, 0])
-    return np.array(boundary, dtype=float)
-
-
-def test_split_boundary_and_curves_at_separator_returns_two_regions():
-    boundary = _square_boundary_loop()
-    separator = np.array(
-        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
+def _grid_points(width, height, spacing=0.5):
+    # A dense, regular point grid over [0, width] x [0, height] --
+    # stands in for a real mesh's cell centroids on a roughly flat
+    # patch, which is what assign_points_to_panels is actually meant
+    # to classify (see section_stl.py's split_mesh_into_panels).
+    xs = np.arange(0, width + spacing / 2, spacing)
+    ys = np.arange(0, height + spacing / 2, spacing)
+    return np.array(
+        [[x, y, 0] for x in xs for y in ys], dtype=float
     )
 
-    regions = split_boundary_and_curves_at_separator(boundary, {}, separator)
 
-    assert len(regions) == 2
-
-    for region in regions:
-        assert "boundary_loop" in region
-        assert "interior_curves" in region
-        # Each region's own boundary is the whole square's perimeter
-        # split roughly in half, plus the separator closing it back
-        # up -- neither region should end up with (almost) everything.
-        assert 5 < len(region["boundary_loop"]) < len(boundary) + len(separator)
-
-
-def test_split_boundary_and_curves_at_separator_keeps_a_one_sided_curve_whole():
-    boundary = _square_boundary_loop()
-    separator = np.array(
-        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
+def _label_at(points, labels, x, y):
+    index = np.argmin(
+        np.linalg.norm(points - np.array([x, y, 0]), axis=1)
     )
-
-    # Entirely at x=0.5 -- well left of the x=2 separator.
-    main_curves = {
-        ("A", 1): np.array(
-            [[0.5, 0, 0], [0.5, 2, 0], [0.5, 4, 0]], dtype=float
-        ),
-    }
-
-    regions = split_boundary_and_curves_at_separator(
-        boundary, main_curves, separator
-    )
-
-    curves_by_region = [r["interior_curves"] for r in regions]
-    non_empty = [c for c in curves_by_region if c]
-
-    # Only one region should have received the curve, whole (not cut).
-    assert len(non_empty) == 1
-    assert len(non_empty[0]) == 1
-    assert len(non_empty[0][0]) == 3
+    return labels[index]
 
 
-def test_split_boundary_and_curves_at_separator_cuts_a_crossing_curve():
-    boundary = _square_boundary_loop()
-    separator = np.array(
-        [[2, 0, 0], [2, 1, 0], [2, 2, 0], [2, 3, 0], [2, 4, 0]], dtype=float
-    )
+def test_assign_points_to_panels_with_no_separators_gives_one_label():
+    points = _grid_points(6, 4)
 
-    # Runs straight across the separator at y=2, from x=0 to x=4.
-    crossing_curve = np.array(
-        [[0, 2, 0], [1, 2, 0], [2.5, 2, 0], [3, 2, 0], [4, 2, 0]],
-        dtype=float,
-    )
-    main_curves = {("B", 1): crossing_curve}
+    labels, skipped = assign_points_to_panels(points, [])
 
-    regions = split_boundary_and_curves_at_separator(
-        boundary, main_curves, separator
-    )
-
-    all_pieces = [
-        piece for r in regions for piece in r["interior_curves"]
-    ]
-
-    # Cut into exactly 2 pieces (one per side), together accounting
-    # for every point of the original curve.
-    assert len(all_pieces) == 2
-    assert sum(len(piece) for piece in all_pieces) == len(crossing_curve)
-
-    left_piece = min(all_pieces, key=lambda p: p[:, 0].mean())
-    right_piece = max(all_pieces, key=lambda p: p[:, 0].mean())
-
-    assert np.all(left_piece[:, 0] < 2)
-    assert np.all(right_piece[:, 0] > 2)
-
-
-def test_split_boundary_and_curves_at_separator_rejects_a_degenerate_separator():
-    boundary = _square_boundary_loop()
-
-    # Both ends snap to the same boundary point.
-    separator = np.array([[2, 0, 0], [2, 0.1, 0], [2, 0, 0]], dtype=float)
-
-    with pytest.raises(ValueError):
-        split_boundary_and_curves_at_separator(boundary, {}, separator)
-
-
-# --------------------------------------------------------------
-# split_into_panels
-# --------------------------------------------------------------
-
-def _rectangle_boundary_loop(width, height):
-    boundary = []
-    for x in np.linspace(0, width, 3 * width + 1):
-        boundary.append([x, 0, 0])
-    for y in np.linspace(0, height, 2 * height + 1)[1:]:
-        boundary.append([width, y, 0])
-    for x in np.linspace(width, 0, 3 * width + 1)[1:]:
-        boundary.append([x, height, 0])
-    for y in np.linspace(height, 0, 2 * height + 1)[1:-1]:
-        boundary.append([0, y, 0])
-    return np.array(boundary, dtype=float)
-
-
-def test_split_into_panels_with_no_separators_returns_one_panel():
-    boundary = _rectangle_boundary_loop(6, 4)
-    main_curves = {
-        0: np.array([[3, 0, 0], [3, 2, 0], [3, 4, 0]], dtype=float),
-    }
-
-    panels, skipped = split_into_panels(boundary, main_curves, [])
-
-    assert len(panels) == 1
-    assert len(panels[0]["interior_curves"]) == 1
     assert skipped == []
+    assert set(labels.tolist()) == {0}
 
 
-def test_split_into_panels_applies_two_independent_separators():
-    # A 6x4 rectangle cut into 3 vertical strips by two independent
+def test_assign_points_to_panels_applies_two_independent_separators():
+    # A 6x4 point grid cut into 3 vertical strips by two independent
     # separators (x=2 and x=4) -- neither separator shares an
     # endpoint with the other, standing in for "visor" and "back tab"
     # seams traced independently on the same patch.
-    boundary = _rectangle_boundary_loop(6, 4)
+    points = _grid_points(6, 4)
 
     separator_1 = np.array([[2, 0, 0], [2, 2, 0], [2, 4, 0]], dtype=float)
     separator_2 = np.array([[4, 0, 0], [4, 2, 0], [4, 4, 0]], dtype=float)
 
-    main_curves = {
-        "left": np.array([[1, 0, 0], [1, 2, 0], [1, 4, 0]], dtype=float),
-        "middle": np.array([[3, 0, 0], [3, 2, 0], [3, 4, 0]], dtype=float),
-        "right": np.array([[5, 0, 0], [5, 2, 0], [5, 4, 0]], dtype=float),
-    }
-
-    panels, skipped = split_into_panels(
-        boundary, main_curves, [separator_1, separator_2]
+    labels, skipped = assign_points_to_panels(
+        points, [separator_1, separator_2]
     )
 
-    assert len(panels) == 3
     assert skipped == []
+    assert len(set(labels.tolist())) == 3
 
-    # Each panel got exactly its own strip's curve, whole.
-    x_means = sorted(
-        panel["interior_curves"][0][:, 0].mean() for panel in panels
-    )
-    assert x_means == pytest.approx([1, 3, 5])
+    left = _label_at(points, labels, 1, 2)
+    middle = _label_at(points, labels, 3, 2)
+    right = _label_at(points, labels, 5, 2)
 
-    for panel in panels:
-        assert len(panel["interior_curves"]) == 1
+    assert len({left, middle, right}) == 3
 
 
-def test_split_into_panels_skips_a_separator_crossing_two_panels():
+def test_assign_points_to_panels_skips_a_separator_crossing_two_panels():
     # One bad seam shouldn't discard every OTHER seam that worked --
     # it's skipped (and reported), not a hard failure for the whole
-    # call. Regression test for a real case: the previous "raise on
-    # the first bad seam" behaviour discarded ALL seams, including
-    # ones that had split off perfectly good panels already.
-    boundary = _rectangle_boundary_loop(6, 4)
+    # call.
+    points = _grid_points(6, 4)
 
-    # First separator splits the rectangle at x=2 into two panels.
+    # First separator splits the grid at x=2 into two panels.
     separator_1 = np.array([[2, 0, 0], [2, 2, 0], [2, 4, 0]], dtype=float)
 
     # Second separator runs from x=1 (inside the first, smaller panel)
@@ -602,12 +484,12 @@ def test_split_into_panels_skips_a_separator_crossing_two_panels():
     # panels rather than staying within one.
     separator_2 = np.array([[1, 0, 0], [3, 2, 0], [5, 4, 0]], dtype=float)
 
-    panels, skipped = split_into_panels(
-        boundary, {}, [separator_1, separator_2]
+    labels, skipped = assign_points_to_panels(
+        points, [separator_1, separator_2]
     )
 
-    # The first (valid) separator still split the rectangle into 2.
-    assert len(panels) == 2
+    # Only the first (valid) separator's split took effect.
+    assert len(set(labels.tolist())) == 2
 
     # The second (invalid) separator was skipped, at its own index,
     # with a reason -- not silently dropped, and not raised.
@@ -616,26 +498,26 @@ def test_split_into_panels_skips_a_separator_crossing_two_panels():
     assert "different existing panels" in skipped[0][1]
 
 
-def test_split_into_panels_skips_a_seam_that_leaves_a_sliver():
-    # Regression test for a real, more severe failure: several seams
-    # traced close together left one boundary with only 3 points --
-    # a razor-thin sliver that still "passed" downstream checks (few
-    # points, easy to stay technically close to) while producing a
-    # badly twisted, physically nonsensical surface. Rejected at the
-    # source now (split_boundary_and_curves_at_separator's own
-    # MIN_ARC_BOUNDARY_POINTS check) and reported as skipped here,
-    # rather than silently handed off to be fit into garbage.
-    boundary = _rectangle_boundary_loop(6, 4)
+def test_assign_points_to_panels_skips_a_seam_that_leaves_a_sliver():
+    # Regression test for a real failure: a seam traced close to an
+    # existing edge (or another seam) can leave almost nothing on one
+    # side -- a razor-thin sliver that, in the earlier curve-network-
+    # splitting version of this project, still "passed" every
+    # downstream check (few points, easy to stay technically close
+    # to) while producing a badly twisted, physically nonsensical
+    # surface. Rejected here instead, before it ever reaches a curve
+    # or a surface.
+    points = _grid_points(6, 4)
 
-    # Snaps to two adjacent boundary points near the corner (0, 0)
-    # and (0.5, 0) -- one side of the split arc is almost nothing.
+    # Both ends snap close to the same corner -- almost every point
+    # ends up on one side of this seam.
     sliver_separator = np.array(
-        [[0, 0, 0], [0.2, 1, 0], [0.5, 0, 0]], dtype=float
+        [[0, 0, 0], [0.2, 0.3, 0], [0, 0.5, 0]], dtype=float
     )
 
-    panels, skipped = split_into_panels(boundary, {}, [sliver_separator])
+    labels, skipped = assign_points_to_panels(points, [sliver_separator])
 
-    assert len(panels) == 1
+    assert set(labels.tolist()) == {0}
     assert len(skipped) == 1
     assert skipped[0][0] == 0
 

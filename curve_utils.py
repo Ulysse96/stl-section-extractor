@@ -920,17 +920,18 @@ def _side_of_polyline_2d(point, polyline):
     nearest segment, so a curved separator is still handled locally
     rather than by one single straight-line approximation.
 
-    Used by split_boundary_and_curves_at_separator to classify which
-    of the two regions a guide-curve point falls into, classifying
-    against the separator itself rather than a full point-in-polygon
-    test against either region's whole boundary: every guide curve's
-    own open endpoints sit ON the outer boundary by construction (see
-    collect_curve_endpoints) -- exactly the degenerate, numerically
-    unstable case a point-in-polygon test is unreliable at (confirmed
-    directly: a point coinciding with a polygon vertex classified
-    inconsistently). Points are generally far from the separator
-    except close to its own two ends, where the classification is
-    genuinely a coin flip anyway.
+    Used by assign_points_to_panels to classify which of two panels a
+    point falls into, classifying against the separator itself rather
+    than a full point-in-polygon test against either panel's whole
+    boundary: an earlier version of this project did exactly that
+    against a curve network's boundary loop, and it was unreliable
+    right where it mattered most -- points sitting ON that boundary by
+    construction (every guide curve's own open endpoints do) are
+    exactly the degenerate, numerically unstable case a point-in-
+    polygon test gets wrong (confirmed directly: a point coinciding
+    with a polygon vertex classified inconsistently). Points are
+    generally far from the separator except close to its own two
+    ends, where the classification is genuinely a coin flip anyway.
     """
 
     best_dist_sq = None
@@ -961,219 +962,42 @@ def _side_of_polyline_2d(point, polyline):
     return best_side > 0
 
 
-# Each side of a seam needs at least this many of the boundary loop's
-# own points to still be a meaningful arc, not a razor-thin sliver --
-# see the comment where this is checked, below.
-MIN_ARC_BOUNDARY_POINTS = 4
+# A split's smaller side needs at least this many points to be a
+# meaningful panel, not a razor-thin sliver -- see the comment where
+# this is checked, below.
+MIN_PANEL_POINTS = 10
 
 
-def split_boundary_and_curves_at_separator(
-    boundary_loop_points, main_curves, separator_points
-):
+def assign_points_to_panels(points_3d, separators):
     """
-    Splits a disk-like patch's boundary loop and A/B guide curves
-    into two regions along a user-traced separator (e.g. where a
-    cap's visor meets its crown) -- both ends of `separator_points`
-    are snapped onto the nearest point of `boundary_loop_points`.
-    Returns a list of exactly 2 dicts, {"boundary_loop": (M, 3)
-    array, "interior_curves": [(K, 3) array, ...]}, one per region --
-    meant to be fed into step_export.py as two separate, simpler
-    surfaces instead of one surface spanning both regions' curvature
-    at once (see README: a single surface fitting a cap's near-flat
-    visor and domed crown together was the direct cause of a real,
-    confirmed-in-SolidWorks boundary-tolerance failure).
+    Assigns every point in `points_3d` to one of several panels, cut
+    by a list of independently-traced seams (`separators`, each an
+    (M, 3) point array, e.g. section_stl.py's own click-a-seam-on-the-
+    mesh points) -- used to split a scanned object's mesh cell
+    centroids into a crown panel, a visor panel, and so on, BEFORE any
+    A/B slicing happens (see the README: reconstructing one surface
+    per panel needs each panel's own clean boundary loop, which is
+    far more reliable computed from an actually-separate mesh than
+    reconstructed after the fact from a shared curve network -- an
+    earlier version of this project did the latter and kept hitting
+    sharp-edged failures traceable to exactly that).
 
-    `main_curves` is a {key: points_3d} dict, e.g. section_stl.py's
-    surface_main_curves (same shape collect_curve_endpoints expects).
-    A curve entirely on one side of the separator stays whole in that
-    region; a curve crossing the separator is cut into pieces (one
-    per side) at the point where its own region classification
-    changes.
-
-    Splits into exactly 2 regions along ONE separator. See
-    split_into_panels for applying several separators, each further
-    subdividing one existing region.
-    """
-
-    boundary_loop_points = np.asarray(boundary_loop_points, dtype=float)
-    separator_points = np.asarray(separator_points, dtype=float)
-
-    start_idx = int(np.argmin(
-        np.linalg.norm(boundary_loop_points - separator_points[0], axis=1)
-    ))
-
-    end_idx = int(np.argmin(
-        np.linalg.norm(boundary_loop_points - separator_points[-1], axis=1)
-    ))
-
-    if start_idx == end_idx:
-        raise ValueError(
-            "The separator's two ends snapped to the same boundary "
-            "point -- trace it further out, closer to two clearly "
-            "different points on the outer edge."
-        )
-
-    def arc(from_idx, to_idx):
-        # boundary_loop_points is cyclic (not itself closed -- same
-        # convention order_boundary_loop returns); walks forward from
-        # from_idx to to_idx, wrapping around the end if needed.
-        if from_idx <= to_idx:
-            return boundary_loop_points[from_idx:to_idx + 1]
-        return np.vstack([
-            boundary_loop_points[from_idx:],
-            boundary_loop_points[:to_idx + 1]
-        ])
-
-    arc_forward = arc(start_idx, end_idx)
-    arc_backward = arc(end_idx, start_idx)
-
-    # A separator whose two ends snap close together along the
-    # boundary (not identical -- that's caught above -- but close
-    # enough that one of the two arcs is almost nothing) produces a
-    # razor-thin sliver region: confirmed directly as the cause of a
-    # real, badly twisted surface on a real scan, where a boundary of
-    # only 3 points still "successfully" passed the surface's own
-    # deviation check (few points, easy to stay technically close to)
-    # while being physically nonsensical. Reject it here instead,
-    # with a message pointing at the actual fix, rather than silently
-    # building garbage that only shows up as a bad surface far later.
-    if min(len(arc_forward), len(arc_backward)) < MIN_ARC_BOUNDARY_POINTS:
-        raise ValueError(
-            "This seam's two ends snapped too close together along "
-            "the boundary, leaving almost no boundary on one side -- "
-            "trace it further from the existing edge (or from other "
-            "seams already traced nearby)."
-        )
-
-    # Each region's boundary is its own arc plus the separator,
-    # traversed so it closes back onto the arc's own start -- the
-    # arc's own endpoints (real boundary points, index-snapped) and
-    # the separator's own endpoints (the user's raw clicks) are only
-    # ever a few mm apart, not identical, but build_single_surface
-    # already closes a boundary loop whose own first/last points
-    # merely aren't quite coincident (see step_export.py), so this
-    # matches the same convention rather than needing special care
-    # here.
-    region_1_boundary = np.vstack([arc_forward, separator_points[-2::-1]])
-    region_2_boundary = np.vstack([arc_backward, separator_points[1:]])
-
-    # One shared 2D projection (over every point either region's
-    # boundary touches) so the separator and every guide curve point
-    # classified against it below agree on the same plane.
-    all_points = np.vstack([boundary_loop_points, separator_points])
-    centroid, basis, _ = _project_onto_best_fit_plane_2d(all_points)
-
-    def to_2d(points_3d):
-        return (np.asarray(points_3d, dtype=float) - centroid) @ basis.T
-
-    separator_2d = to_2d(separator_points)
-
-    # Which boolean _side_of_polyline_2d returns actually means
-    # "region 1" -- calibrated once against a point already known to
-    # be in region 1 (safely away from the separator itself: the
-    # middle of its own arc, not the arc's shared endpoints).
-    region_1_reference_2d = to_2d(arc_forward[len(arc_forward) // 2])
-    region_1_side = _side_of_polyline_2d(region_1_reference_2d, separator_2d)
-
-    region_1_curves = []
-    region_2_curves = []
-
-    for curve_points in main_curves.values():
-
-        curve_points = np.asarray(curve_points, dtype=float)
-
-        if len(curve_points) < 2:
-            continue
-
-        curve_2d = to_2d(curve_points)
-
-        in_region_1 = np.array([
-            _side_of_polyline_2d(p, separator_2d) == region_1_side
-            for p in curve_2d
-        ])
-
-        piece_start = 0
-
-        for i in range(1, len(curve_points)):
-
-            if in_region_1[i] != in_region_1[i - 1]:
-
-                piece = curve_points[piece_start:i]
-
-                if len(piece) >= 2:
-                    target = (
-                        region_1_curves if in_region_1[piece_start]
-                        else region_2_curves
-                    )
-                    target.append(piece)
-
-                piece_start = i
-
-        piece = curve_points[piece_start:]
-
-        if len(piece) >= 2:
-            target = (
-                region_1_curves if in_region_1[piece_start]
-                else region_2_curves
-            )
-            target.append(piece)
-
-    return [
-        {
-            "boundary_loop": region_1_boundary,
-            "interior_curves": region_1_curves,
-        },
-        {
-            "boundary_loop": region_2_boundary,
-            "interior_curves": region_2_curves,
-        },
-    ]
-
-
-def split_into_panels(boundary_loop_points, main_curves, separators):
-    """
-    Splits a disk-like patch into several panels from a list of
-    independently-traced separators (e.g. one seam between the crown
-    and the visor, another between the crown and a back tab) --
-    each separator further subdivides whichever ONE of the panels
-    built so far its own two ends land closest to, via
-    split_boundary_and_curves_at_separator. Both of a separator's
-    ends must land on the SAME current panel's boundary (tracing one
-    separator across what are already two different panels isn't
-    supported -- trace it within a single existing panel instead).
-
-    `separators` is a list of (M, 3) point arrays, one per traced
-    seam, applied in order. Returns `(regions, skipped)`: `regions` is
-    a list of panel dicts (same shape as split_boundary_and_curves_
-    at_separator's own return value) -- a single panel covering the
-    whole patch if `separators` is empty (or none of them could be
-    applied). `skipped` is a list of `(index, reason)` for any
-    separator (its position in the input `separators` list) that
-    could NOT be applied -- its own two ends landing on different
-    existing panels, or split_boundary_and_curves_at_separator itself
-    rejecting it (e.g. too close to an existing edge). One bad seam
-    doesn't discard every OTHER seam that worked fine: it's just
-    skipped, same reasoning as step_export.py skipping one region
-    that can't be built rather than aborting the whole export.
+    Returns `(labels, skipped)`: `labels` is an int array, one entry
+    per input point, values `0..n_panels-1` (all zero if `separators`
+    is empty -- a single panel). `skipped` is a list of
+    `(separator_index, reason)` for any separator that could not be
+    applied -- its own two ends landing in different existing panels,
+    or leaving one side with too few points to be a meaningful panel
+    (a seam traced too close to an existing edge, or to another seam
+    already applied). One bad seam doesn't discard every OTHER seam
+    that worked fine: it's just skipped, same reasoning as
+    step_export.py skipping one region that can't be built rather
+    than aborting the whole export.
     """
 
-    regions = [{
-        "boundary_loop": np.asarray(boundary_loop_points, dtype=float),
-        "interior_curves": [
-            np.asarray(points, dtype=float)
-            for points in main_curves.values()
-            if len(points) >= 2
-        ],
-    }]
+    points_3d = np.asarray(points_3d, dtype=float)
 
-    def nearest_region_index(point):
-
-        distances = [
-            np.linalg.norm(region["boundary_loop"] - point, axis=1).min()
-            for region in regions
-        ]
-
-        return int(np.argmin(distances))
+    labels = np.zeros(len(points_3d), dtype=int)
 
     skipped = []
 
@@ -1181,34 +1005,68 @@ def split_into_panels(boundary_loop_points, main_curves, separators):
 
         separator_points = np.asarray(separator_points, dtype=float)
 
-        start_region = nearest_region_index(separator_points[0])
-        end_region = nearest_region_index(separator_points[-1])
+        start_label = labels[np.argmin(
+            np.linalg.norm(points_3d - separator_points[0], axis=1)
+        )]
+        end_label = labels[np.argmin(
+            np.linalg.norm(points_3d - separator_points[-1], axis=1)
+        )]
 
-        if start_region != end_region:
+        if start_label != end_label:
             skipped.append((
                 separator_index,
-                "its two ends landed on different existing panels -- "
+                "its two ends landed in different existing panels -- "
                 "trace it within a single panel (one already-split-"
                 "off region), not across panels that were already "
                 "split apart."
             ))
             continue
 
-        target = regions[start_region]
+        target_indices = np.nonzero(labels == start_label)[0]
+        target_points = points_3d[target_indices]
 
-        target_curves = {
-            i: points
-            for i, points in enumerate(target["interior_curves"])
-        }
+        # One shared 2D projection (over this panel's own points plus
+        # the separator) so the separator and every one of this
+        # panel's points, classified against it below, agree on the
+        # same plane.
+        all_points = np.vstack([target_points, separator_points])
+        centroid, basis, _ = _project_onto_best_fit_plane_2d(all_points)
 
-        try:
-            split_result = split_boundary_and_curves_at_separator(
-                target["boundary_loop"], target_curves, separator_points
-            )
-        except ValueError as exc:
-            skipped.append((separator_index, str(exc)))
+        def to_2d(points):
+            return (np.asarray(points, dtype=float) - centroid) @ basis.T
+
+        separator_2d = to_2d(separator_points)
+        target_2d = to_2d(target_points)
+
+        on_positive_side = np.array([
+            _side_of_polyline_2d(p, separator_2d) for p in target_2d
+        ])
+
+        n_positive = int(on_positive_side.sum())
+        n_negative = len(on_positive_side) - n_positive
+
+        # A seam whose two ends snap close together (not identical --
+        # that can't happen here since both would then share a label
+        # and get caught by the "different panels" check above only
+        # if they genuinely differ; a near-tie instead) leaves almost
+        # nothing on one side: confirmed directly as the cause of a
+        # real, badly twisted surface on a real scan, where a
+        # 3-point boundary still "successfully" passed every
+        # downstream check (few points, easy to stay technically
+        # close to) while being physically nonsensical. Reject it
+        # here instead, before it ever reaches a curve or a surface.
+        if min(n_positive, n_negative) < MIN_PANEL_POINTS:
+            skipped.append((
+                separator_index,
+                "this seam's two ends snapped too close together, "
+                "leaving almost no points on one side -- trace it "
+                "further from the existing edge (or from other seams "
+                "already traced nearby)."
+            ))
             continue
 
-        regions[start_region:start_region + 1] = split_result
+        new_label = int(labels.max()) + 1
 
-    return regions, skipped
+        labels[target_indices[~on_positive_side]] = new_label
+
+    return labels, skipped
